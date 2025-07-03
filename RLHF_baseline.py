@@ -1,6 +1,6 @@
 #install dependencies
-!pip install trl datasets accelerate peft transformers --quiet
-!pip install bitsandbytes --quiet  # for faster loading
+#!pip install trl datasets accelerate peft transformers --quiet
+#!pip install bitsandbytes --quiet  # for faster loading
 
 #load base model
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -22,7 +22,11 @@ from datasets import Dataset
 from sklearn.model_selection import train_test_split
 
 reward_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
+# here you just take a default reward model 
 reward_model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=1)
+
+# reward_model = load(our_pretrained_model_from_other_file) 
 
 def preprocess_reward(example):
     return {

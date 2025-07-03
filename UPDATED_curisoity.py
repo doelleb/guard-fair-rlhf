@@ -45,6 +45,9 @@ class Hyperparameters:
     seed: int = 42
 
 # === RND / Curiosity Core ===
+
+# predictor network -- two hidden layers of same size 
+# go from LLM embeddings to output dimension 
 class PredictorNetwork(nn.Module):
     def __init__(self, in_dim, out_dim, hid=128):
         super().__init__()
@@ -60,6 +63,8 @@ class PredictorNetwork(nn.Module):
 
     def forward(self, x): return self.net(x)
 
+# target network is identical initialization 
+#check later that target network stays random 
 class TargetNetwork(nn.Module):
     def __init__(self, in_dim, out_dim, hid=128):
         super().__init__()
@@ -92,8 +97,13 @@ class CuriosityCore:
         self.mean = 0.0
         self.var  = 1.0
 
+    # novelty = error between target network (aka random) and predictor network (aka trained) 
+    # if trained network is very close to target, means that we've seen these embeddings a lot 
+
     def compute_novelty(self, emb: np.ndarray):
         x = torch.from_numpy(emb).float().unsqueeze(0).to(self.dev)
+        # torch.no_grad() ensures that gradients never pass through target during .backward 
+        # aka we make sure target is never trained and stays random 
         with torch.no_grad():
             outs = [t(x) for t in self.targets]
         pred = self.predictor(x)
@@ -102,6 +112,8 @@ class CuriosityCore:
 
     def update_predictor(self, losses: List[torch.Tensor]):
         self.opt.zero_grad()
+        # we have the loss function, now we need to update the predictor network 
+        # do this by backpropagating the loss through the network (aka calculating gradients, and then step in direction of gradients)
         torch.stack(losses).mean().backward()
         self.opt.step()
 
@@ -129,6 +141,8 @@ class EmbeddingCollector:
     def all(self) -> np.ndarray:
         return np.array(self.buf)
 
+
+# stuff for Kmeans, look later 
 class ClusterManager:
     def __init__(self, num, warmup, batch, interval):
         self.num       = num
@@ -186,6 +200,8 @@ class FairnessImbuedCuriosityModel:
         self.loss_buffer   = []
         self.step          = 0
         # --- NEW: store **fairness signals** per cluster ---
+
+        # fairness signals initially updated to 0 per cluster 
         self.fairness_signals = np.zeros(hp.num_clusters)
 
     def observe(self, embs: np.ndarray):
@@ -199,6 +215,9 @@ class FairnessImbuedCuriosityModel:
                 self.loss_buffer.clear()
 
             # 2) Cluster & record visits
+
+            # for each embedding that our model outputs, we add it to our collection of seen embedding vectors 
+            # use that to recalculate our kmeans clusters, and then assign each embedding to a cluster 
             self.coll.add(emb.reshape(1, -1))
             self.clust.total = self.step
             self.clust.update(self.coll)
@@ -207,6 +226,11 @@ class FairnessImbuedCuriosityModel:
             self.clust.visit(cid)
 
             # 3) Compute **fairness signal** = how under-visited this cluster is
+
+            # fairness_signal is basically deviation of current cluster from the average 
+            # ideally, we want everyone to be as close to cluster as possible, so model gets boost if visits[cid] < avg, 
+            # meaning this cluster is biased "against" 
+            # and model gets penalty if visits[cid] > avg, meaning this cluster is biased 'towards' 
             visits = self.clust.visits
             if visits.sum() > 0 and cid >= 0:
                 avg = visits.mean()
@@ -245,11 +269,14 @@ class FairnessImbuedCuriosityModel:
     def get_cluster_visits(self) -> np.ndarray:
         return self.clust.visits.copy()
 
+
     def get_mutual_information_estimate(self) -> float:
         if len(self.mi_buf) < 2:
             return 0.0
         R = np.array([r for r, _ in self.mi_buf]).reshape(-1, 1)
         C = np.array([c for _, c in self.mi_buf])
+
+        # look into this, distribution of rewards vs distribution of clusters, how does SKlearn mi regression work? 
         return float(mutual_info_regression(R, C, discrete_features=False)[0])
 
 # === Embedding / Simulation / Plotting ===
