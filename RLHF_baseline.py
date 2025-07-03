@@ -2,7 +2,6 @@
 #!pip install trl datasets accelerate peft transformers --quiet
 #!pip install bitsandbytes --quiet  # for faster loading
 
-#load base model
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_name = "sshleifer/tiny-gpt2"  # super small, fast for demo
@@ -12,8 +11,8 @@ model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
 #load HH-RLHF dataset
 from datasets import load_dataset
 
-dataset = load_dataset("HuggingFaceH4/hh-rlhf", split="train[:300]")
-print(dataset[0])
+dataset = load_dataset("Anthropic/hh-rlhf", split="train[:300]")
+print(dataset)
 
 #train a simple reward model distilbert-style to predict preference (chosen > rejected)
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
@@ -38,6 +37,8 @@ raw_dataset = dataset.select(range(300))  # select a few examples
 
 reward_data = []
 for ex in raw_dataset:
+    #print(ex, ex.keys())
+
     reward_data.append({"text": ex["chosen"], "label": 1})
     reward_data.append({"text": ex["rejected"], "label": 0})
 
@@ -52,7 +53,7 @@ tokenized_reward = reward_dataset.map(tokenize_reward, batched=True)
 training_args = TrainingArguments(
     per_device_train_batch_size=4,
     per_device_eval_batch_size=4,
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     save_strategy="no",
     num_train_epochs=1,
     output_dir="./reward_model_output",
@@ -94,6 +95,8 @@ for prompt in prompts:
         reward = reward_model(tokenizer.batch_decode(full_input, skip_special_tokens=True)[0], return_dict=True).logits[0]
 
     reward_score = torch.tensor([reward.item()])
+
+    print(reward_score)
     ppo_trainer.step([query_tensor[0]], [response_tensor[0]], reward_score)
 
 #save models

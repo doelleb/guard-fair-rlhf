@@ -45,6 +45,8 @@ class ScriptArguments:
     gradient_accumulation_steps: Optional[int] = field(default=64)
     learning_rate: Optional[float] = field(default=2e-6)
     weight_decay: Optional[float] = field(default=0.001)
+
+    # TOOD: replace this default with the tiny-gpt2 you found so that this can run on your laptop 
     model_name: Optional[str] = field(
         default="meta-llama/Meta-Llama-3-8B-Instruct",
         metadata={
@@ -248,6 +250,8 @@ def compute_metrics(eval_pred):
     return result
 
 
+class FairnessLoss(nn.Module): 
+
 # loss for reward model: 
 class RewardTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -263,6 +267,9 @@ class RewardTrainer(Trainer):
         rewards_k = rewards[kidx]
 
         # loss is the bradley terry loss that tries to push likelihood of preferred over not preferred as high as possible 
+
+        # TODO: potential challenge 
+        # advay's fairness loss depends on "logging" certain objects such as embedding clusters, ... + all the RND stuff such as target network/predictor network (advay fill these values in) 
         loss = -nn.functional.logsigmoid(rewards_j - rewards_k).mean() # + some Fairness loss that depends on advay's code 
         if return_outputs:
             return loss, {"rewards_j": rewards_j, "rewards_k": rewards_k}
