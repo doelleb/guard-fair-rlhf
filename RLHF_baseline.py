@@ -24,6 +24,8 @@ reward_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 
 # here you just take a default reward model 
 reward_model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=1)
+# Ensure reward model is on the same device as the main model
+reward_model = reward_model.to(model.device)
 
 # reward_model = load(our_pretrained_model_from_other_file) 
 
@@ -39,8 +41,8 @@ reward_data = []
 for ex in raw_dataset:
     #print(ex, ex.keys())
 
-    reward_data.append({"text": ex["chosen"], "label": 1})
-    reward_data.append({"text": ex["rejected"], "label": 0})
+    reward_data.append({"text": ex["chosen"], "label": 1.0})
+    reward_data.append({"text": ex["rejected"], "label": 0.0})
 
 reward_dataset = Dataset.from_list(reward_data)
 reward_dataset = reward_dataset.train_test_split(test_size=0.1)
