@@ -165,7 +165,7 @@ if __name__ == "__main__":
             sample["attention_mask_k"] = tok_neg["attention_mask"]
             return sample
 
-        ds = load_dataset(train_path, split="train").shuffle(seed=42)
+        ds = load_dataset(train_path, split="train[:100]").shuffle(seed=42) #only 100 questions are being used for training; check if syntax is working fine
         ds = ds.map(tokenize, num_proc=8)  # you can drop num_proc if you prefer
 
         train_dataset = ds
