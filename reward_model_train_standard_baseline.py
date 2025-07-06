@@ -113,10 +113,7 @@ if __name__ == "__main__":
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
-    # Load the value-head model and tokenizer.
     tokenizer_name = script_args.model_name
-    # right after you load your tokenizer:
-        # right after you load & wrap your tokenizer…
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, use_fast=False)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
@@ -125,8 +122,12 @@ if __name__ == "__main__":
         script_args.model_name,
         num_labels=1,
         torch_dtype=torch.bfloat16 if script_args.bf16 else None,
-        #attn_implementation="flash_attention_2",  # ← enable FlashAttention v2, not avialable on windows, without having to install it via git
+        #attn_implementation="flash_attention_2",  # ← enable FlashAttention v2, not avialable on windows, without having to install it via github repo
     )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = model.to(device)
+
 
     tokenizer.model_max_length = model.config.n_positions
     model.config.use_cache = not script_args.gradient_checkpointing
@@ -159,17 +160,17 @@ if __name__ == "__main__":
             tok_pos = tokenizer(pos, truncation=True, max_length=tokenizer.model_max_length)
             tok_neg = tokenizer(neg, truncation=True, max_length=tokenizer.model_max_length)
 
-            sample["input_ids_j"]      = tok_pos["input_ids"]
+            sample["input_ids_j"]      = tok_pos["input_ids"] 
             sample["attention_mask_j"] = tok_pos["attention_mask"]
             sample["input_ids_k"]      = tok_neg["input_ids"]
             sample["attention_mask_k"] = tok_neg["attention_mask"]
             return sample
 
-        ds = load_dataset(train_path, split="train[:100]").shuffle(seed=42) #only 100 questions are being used for training; check if syntax is working fine
-        ds = ds.map(tokenize, num_proc=8)  # you can drop num_proc if you prefer
+        ds = load_dataset(train_path, split="train[:1000]").shuffle(seed=42) #only 100 questions are being used for training; check if syntax is working fine
+        ds = ds.map(tokenize, num_proc=8)
 
         train_dataset = ds
-        eval_dataset  = ds.select(range(500))
+        eval_dataset  = ds.select(range(100))
         return train_dataset, eval_dataset
 
 
@@ -177,9 +178,6 @@ if __name__ == "__main__":
     train_dataset, eval_dataset = build_dataset(tokenizer, train_path, eval_path)
     print(f"Loaded {len(train_dataset)} train examples, {len(eval_dataset)} eval examples")
     print("Training set: ", len(train_dataset), " Eval set: ", len(eval_dataset))
-
-    # Define the trainer
-
 
     # Define the trainer
     training_args = TrainingArguments(
@@ -214,7 +212,6 @@ if __name__ == "__main__":
     original_columns = train_dataset.column_names
 
 
-    # We need to define a special data collator that batches the data in our j vs k format.
     @dataclass
     class RewardDataCollatorWithPadding:
         tokenizer: AutoTokenizer
@@ -313,6 +310,62 @@ if __name__ == "__main__":
 
 
     print("Saving last checkpoint of the model")
-    #model.save_pretrained(output_name + "/last_checkpoint")
     trainer.save_model(output_name + "/last_checkpoint")
     tokenizer.save_pretrained(output_name + "/last_checkpoint")
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from scipy.stats import gaussian_kde
+    from datasets import load_dataset
+
+    model.eval()
+    sns.set_theme(style="whitegrid")
+
+    # grab 100 HH-RLHF pairs
+    pairs = load_dataset("Dahoas/full-hh-rlhf", split="train") \
+            .shuffle(seed=42).select(range(100))
+
+    def get_reward_score(text: str) -> float:
+        # clamp to the model’s actual context size
+        max_len = tokenizer.model_max_length
+        toks = tokenizer(
+            text,
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt"
+        ).to(device)
+        with torch.no_grad():
+            return model(**toks).logits.squeeze().cpu().item()
+
+    chosen_scores   = np.array([get_reward_score(ex["chosen"])   for ex in pairs])
+    rejected_scores = np.array([get_reward_score(ex["rejected"]) for ex in pairs])
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(style="whitegrid")
+    plt.figure(figsize=(8, 5))
+
+    # plot KDEs
+    sns.kdeplot(
+        chosen_scores,
+        label="Helpful",
+        fill=True,
+        alpha=0.5,
+        linewidth=2
+    )
+    sns.kdeplot(
+        rejected_scores,
+        label="Harmless",
+        fill=True,
+        alpha=0.5,
+        linewidth=2
+    )
+
+    plt.xlabel("Rewards")
+    plt.ylabel("Density")
+    plt.title("Reward Distribution: Helpful vs. Harmless")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
