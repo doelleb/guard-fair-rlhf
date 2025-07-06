@@ -61,10 +61,13 @@ if __name__ == "__main__":
         )
         bf16: Optional[bool] = field(
             default=False,
-            metadata={
-                "help": "This essentially cuts the training time in half if you want to sacrifice a little precision and have a supported GPU."
-            },
+            metadata={"help": "Use bfloat16 if supported"}
         )
+        fp16: Optional[bool] = field(
+            default=True,   # ← enable float16 by default
+            metadata={"help": "Use float16 mixed precision"}
+        )
+
         num_train_epochs: Optional[int] = field(
             default=1,
             metadata={"help": "The number of training epochs for the reward model."},
@@ -122,7 +125,9 @@ if __name__ == "__main__":
         script_args.model_name,
         num_labels=1,
         torch_dtype=torch.bfloat16 if script_args.bf16 else None,
+        #attn_implementation="flash_attention_2",  # ← enable FlashAttention v2, not avialable on windows, without having to install it via git
     )
+
     tokenizer.model_max_length = model.config.n_positions
     model.config.use_cache = not script_args.gradient_checkpointing
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -237,11 +242,10 @@ if __name__ == "__main__":
             ctx = self.tokenizer.model_max_length
             batch = self.tokenizer.pad(
                 merged_features,
-                padding="max_length",
-                max_length=min(self.max_length, ctx),
-                pad_to_multiple_of=self.pad_to_multiple_of,
+                padding="longest",           # ← use dynamic (“longest”) padding
                 return_tensors=self.return_tensors,
             )
+
 
             # just in case any sequence slipped past, truncate last dim
             if batch["input_ids"].size(1) > ctx:
