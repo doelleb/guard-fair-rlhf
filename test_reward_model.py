@@ -9,6 +9,8 @@
 # run reward model on each of the examples and plot the helpful distribution and plot the harmless distribution of rewards 
 # ideally, for base model, these are going to be very different because model is biased 
 # then, once we add our fairness, we should see that the distributions are much closer 
+
+#!pip install --upgrade datasets
 import torch
 import numpy as np
 from datasets import load_dataset
