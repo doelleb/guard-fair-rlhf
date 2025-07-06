@@ -1,11 +1,20 @@
-#install dependencies
-#!pip install trl datasets accelerate peft transformers --quiet
-#!pip install bitsandbytes --quiet  # for faster loading
+!pip install \
+  torch==2.0.1 \
+  trl==0.7.9 \
+  transformers==4.31.0 \
+  accelerate==0.21.0 \
+  huggingface_hub==0.16.4 \
+  diffusers==0.20.2 \
+  peft==0.4.0 \
+  datasets==2.14.4
 
+#install dependencies
+!pip install bitsandbytes --quiet  # for faster loading
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_name = "sshleifer/tiny-gpt2"  # super small, fast for demo
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto")
 
 #load HH-RLHF dataset
@@ -22,12 +31,12 @@ from sklearn.model_selection import train_test_split
 
 reward_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
 
-# here you just take a default reward model 
+# here you just take a default reward model
 reward_model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=1)
 # Ensure reward model is on the same device as the main model
 reward_model = reward_model.to(model.device)
 
-# reward_model = load(our_pretrained_model_from_other_file) 
+# reward_model = load(our_pretrained_model_from_other_file)
 
 def preprocess_reward(example):
     return {
@@ -75,26 +84,49 @@ from trl import PPOTrainer, PPOConfig
 import torch
 
 ppo_config = PPOConfig(
-    model_name=model_name,
     learning_rate=1e-5,
     batch_size=1,
     mini_batch_size=1,
     gradient_accumulation_steps=1,
-    optimize_cuda_cache=False,
+    bf16=False,
+    fp16=False
 )
 
-ppo_trainer = PPOTrainer(ppo_config, model, tokenizer, reward_model=reward_model)
+class DummyProcessor:
+    def __call__(self, samples):
+        return samples
+
+ppo_trainer = PPOTrainer(
+    ppo_config,
+    model=model,
+    ref_model=AutoModelForCausalLM.from_pretrained(model_name, device_map="auto"),
+    reward_model=reward_model,
+    value_model=AutoModelForCausalLM.from_pretrained(model_name, device_map="auto"),
+    train_dataset=tokenized_reward["train"],
+    processing_class=DummyProcessor())
 
 # Create mini prompt set for demo
 prompts = ["What is the capital of France?", "Explain photosynthesis."] * 5
+
+tokenizer.pad_token = tokenizer.eos_token
 
 for prompt in prompts:
     query_tensor = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
     response_tensor = model.generate(query_tensor, max_new_tokens=30)
     full_input = torch.cat([query_tensor, response_tensor], dim=1)
 
+    # Step 1: Decode tensor input into strings
+    decoded_input = tokenizer.batch_decode(full_input, skip_special_tokens=True)
+
+    # Step 2: Tokenize the strings
+    reward_inputs = tokenizer(decoded_input, return_tensors="pt", padding=True, truncation=True)
+
+    # Step 3: Move to model's device
+    reward_inputs = {k: v.to(model.device) for k, v in reward_inputs.items()}
+
+    # Step 4: Inference
     with torch.no_grad():
-        reward = reward_model(tokenizer.batch_decode(full_input, skip_special_tokens=True)[0], return_dict=True).logits[0]
+      reward = reward_model(**reward_inputs).logits[0]
 
     reward_score = torch.tensor([reward.item()])
 
