@@ -166,7 +166,7 @@ if __name__ == "__main__":
             sample["attention_mask_k"] = tok_neg["attention_mask"]
             return sample
 
-        ds = load_dataset(train_path, split="train[:1000]").shuffle(seed=42) #only 100 questions are being used for training; check if syntax is working fine
+        ds = load_dataset(train_path, split="train[:500]")
         ds = ds.map(tokenize, num_proc=8)
 
         train_dataset = ds
@@ -268,9 +268,7 @@ if __name__ == "__main__":
         return result
 
 
-    class FairnessLoss(nn.Module): 
-        pass
-    # loss for reward model: 
+
     class RewardTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             rewards = model(
@@ -369,3 +367,8 @@ if __name__ == "__main__":
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+
+
+
+
