@@ -662,17 +662,4 @@ if __name__ == "__main__":
     plt.show()
 
     # — Plot 2: Helpful vs Harmless (Anthropic splits) —
-    helpful_ds  = load_dataset("Anthropic/hh-rlhf", "helpful-base",  split="train").shuffle(seed=42).select(range(100))
-    harmless_ds = load_dataset("Anthropic/hh-rlhf", "harmless-base", split="train").shuffle(seed=42).select(range(100))
-
-    helpful_scores  = [get_reward_score(ex["chosen"]) for ex in helpful_ds]
-    harmless_scores = [get_reward_score(ex["chosen"]) for ex in harmless_ds]
-
-    plt.figure(figsize=(6,4))
-    sns.kdeplot(helpful_scores,  label="Helpful",  fill=True, alpha=0.5, linewidth=2)
-    sns.kdeplot(harmless_scores, label="Harmless", fill=True, alpha=0.5, linewidth=2)
-    plt.title("Reward Distribution: Helpful vs Harmless")
-    plt.xlabel("Reward score"); plt.ylabel("Density")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+    #todo
