@@ -417,28 +417,37 @@ if __name__ == "__main__":
 
     def build_dataset(tokenizer, train_path, eval_path):
         def tokenize(sample):
-            def unwrap(x):
-                while isinstance(x, (list, tuple)) and len(x) > 0:
-                    x = x[0]
-                return x
+            # 1) If chosen/rejected come in as lists, grab the *last* element
+            raw_chosen  = sample["chosen"][-1]  if isinstance(sample["chosen"],  (list, tuple)) else sample["chosen"]
+            raw_rejected = sample["rejected"][-1] if isinstance(sample["rejected"], (list, tuple)) else sample["rejected"]
 
-            pos = unwrap(sample["chosen"])
-            neg = unwrap(sample["rejected"])
+            # 2) If that element is a dict, extract its 'content'; otherwise assume it's already a string
+            text_j = raw_chosen["content"]  if isinstance(raw_chosen, dict)  else raw_chosen
+            text_k = raw_rejected["content"] if isinstance(raw_rejected, dict) else raw_rejected
 
-            pos = pos if isinstance(pos, str) else str(pos)
-            neg = neg if isinstance(neg, str) else str(neg)
+            # 3) Tokenize each side
+            tok_j = tokenizer(
+                text_j,
+                truncation=True,
+                max_length=tokenizer.model_max_length
+            )
+            tok_k = tokenizer(
+                text_k,
+                truncation=True,
+                max_length=tokenizer.model_max_length
+            )
 
-            tok_pos = tokenizer(pos, truncation=True, max_length=tokenizer.model_max_length)
-            tok_neg = tokenizer(neg, truncation=True, max_length=tokenizer.model_max_length)
+            # 4) Store everything back on the sample
+            sample["input_ids_j"]      = tok_j["input_ids"]
+            sample["attention_mask_j"] = tok_j["attention_mask"]
+            sample["input_ids_k"]      = tok_k["input_ids"]
+            sample["attention_mask_k"] = tok_k["attention_mask"]
+            sample["text_j"]           = text_j
+            sample["text_k"]           = text_k
 
-            sample["input_ids_j"]      = tok_pos["input_ids"]
-            sample["attention_mask_j"] = tok_pos["attention_mask"]
-            sample["input_ids_k"]      = tok_neg["input_ids"]
-            sample["attention_mask_k"] = tok_neg["attention_mask"]
-            # Store original texts for curiosity model
-            sample["text_j"] = pos
-            sample["text_k"] = neg
             return sample
+
+
 
         ds = load_dataset(train_path, split="train[:500]")
         ds = ds.map(tokenize, num_proc=8)
@@ -480,54 +489,52 @@ if __name__ == "__main__":
     num_proc = 24
     original_columns = train_dataset.column_names
 
+    from dataclasses import dataclass
+    from typing import Any, Dict, List, Optional, Union
+    import torch
+    from transformers import AutoTokenizer
+    from transformers.tokenization_utils_base import PaddingStrategy
+
+
     @dataclass
     class RewardDataCollatorWithPadding:
         tokenizer: AutoTokenizer
-        padding: Union[bool, str, PaddingStrategy] = "max_length"
+        padding: Union[bool, str, PaddingStrategy] = "longest"
         max_length: Optional[int] = None
         pad_to_multiple_of: Optional[int] = None
         return_tensors: str = "pt"
 
         def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-            merged_features = []
-            texts_j = []
-            texts_k = []
+            # 1) Extract texts
+            texts_j = [f["text_j"] for f in features]
+            texts_k = [f["text_k"] for f in features]
 
-            for feature in features:
-                merged_features.append(
-                    {
-                        "input_ids": feature["input_ids_j"],
-                        "attention_mask": feature["attention_mask_j"],
-                    }
-                )
-                merged_features.append(
-                    {
-                        "input_ids": feature["input_ids_k"],
-                        "attention_mask": feature["attention_mask_k"],
-                    }
-                )
-                texts_j.append(feature["text_j"])
-                texts_k.append(feature["text_k"])
+            # 2) Build an interleaved list [j0, k0, j1, k1, ...]
+            interleaved = []
+            for j, k in zip(texts_j, texts_k):
+                interleaved.append(j)
+                interleaved.append(k)
 
-            ctx = self.tokenizer.model_max_length
-            batch = self.tokenizer.pad(
-                merged_features,
-                padding="longest",
+            # 3) Tokenize *all* at once so they share the same pad/truncate
+            batch = self.tokenizer(
+                interleaved,
+                padding=self.padding,
+                truncation=True,
+                max_length=self.max_length or self.tokenizer.model_max_length,
+                pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors=self.return_tensors,
             )
 
-            if batch["input_ids"].size(1) > ctx:
-                batch["input_ids"]      = batch["input_ids"][:, -ctx:]
-                batch["attention_mask"] = batch["attention_mask"][:, -ctx:]
-            
-            batch = {
-                "input_ids": batch["input_ids"],
-                "attention_mask": batch["attention_mask"],
-                "return_loss": True,
-                "texts_j": texts_j,
-                "texts_k": texts_k,
+            # 4) Return exactly the tensors the trainer expects
+            return {
+                "input_ids":      batch["input_ids"],      # shape: (2*batch_size, seq_len)
+                "attention_mask": batch["attention_mask"], # same shape
+                "return_loss":    True,
+                "texts_j":        texts_j,
+                "texts_k":        texts_k,
             }
-            return batch
+
+
 
     def compute_metrics(eval_pred):
         result = {}
@@ -536,7 +543,6 @@ if __name__ == "__main__":
         result["accuracy"] = np.sum(
             pos_predictions_scores > neg_predictions_scores) / len(pos_predictions_scores)
         return result
-
     class RewardTrainer(Trainer):
         def __init__(self, *args, fair_curiosity_model=None, script_args=None, **kwargs):
             super().__init__(*args, **kwargs)
@@ -560,23 +566,14 @@ if __name__ == "__main__":
                 texts_j = inputs["texts_j"]
                 texts_k = inputs["texts_k"]
 
-                # Grab the tokenizer from your collator, and device from the model:
-                tok = self.data_collator.tokenizer
+                tok    = self.data_collator.tokenizer
                 device = next(model.parameters()).device
 
-                embs_j = get_llm_embeddings(
-                    texts_j,
-                    model_name=self.script_args.model_name,
-                    device=device
-                )
-                embs_k = get_llm_embeddings(
-                    texts_k,
-                    model_name=self.script_args.model_name,
-                    device=device
-                )
+                embs_j = get_llm_embeddings(texts_j,  model_name=self.script_args.model_name, device=device)
+                embs_k = get_llm_embeddings(texts_k,  model_name=self.script_args.model_name, device=device)
 
+                # accumulate curiosity as a Python float
                 curiosity_loss = 0.0
-                # observe with group labels if you like
                 for emb in embs_j:
                     self.fair_curiosity_model.observe(emb.reshape(1, -1), group="helpful")
                     curiosity_loss += self.fair_curiosity_model.intrinsic_reward(emb, group="helpful")
@@ -585,11 +582,15 @@ if __name__ == "__main__":
                     curiosity_loss += self.fair_curiosity_model.intrinsic_reward(emb, group="harmless")
 
                 curiosity_loss /= (len(embs_j) + len(embs_k))
-                loss += curiosity_loss
+                loss = loss + curiosity_loss
+
+                # print without .item() on a float
+                print(f"BT loss: {loss.item():.4f}, curiosity: {curiosity_loss:.4f}")
 
             if return_outputs:
                 return loss, {"rewards_j": rewards_j, "rewards_k": rewards_k}
             return loss
+
 
 
 
@@ -615,7 +616,6 @@ if __name__ == "__main__":
         compute_metrics=compute_metrics,
         data_collator=RewardDataCollatorWithPadding(
             tokenizer=tokenizer,
-            max_length=script_args.max_length
         ),
         fair_curiosity_model=fair_curiosity_model,
         script_args=script_args
@@ -630,18 +630,12 @@ if __name__ == "__main__":
     trainer.save_model(output_name + "/last_checkpoint")
     tokenizer.save_pretrained(output_name + "/last_checkpoint")
 
-    import seaborn as sns
-    from scipy.stats import gaussian_kde
-
     model.eval()
+    import seaborn as sns
     sns.set_theme(style="whitegrid")
 
-    # grab 100 HH-RLHF pairs
-    pairs = load_dataset("Dahoas/full-hh-rlhf", split="train") \
-            .shuffle(seed=42).select(range(100))
 
     def get_reward_score(text: str) -> float:
-        # clamp to the model’s actual context size
         max_len = tokenizer.model_max_length
         toks = tokenizer(
             text,
@@ -652,31 +646,33 @@ if __name__ == "__main__":
         with torch.no_grad():
             return model(**toks).logits.squeeze().cpu().item()
 
-    chosen_scores   = np.array([get_reward_score(ex["chosen"])   for ex in pairs])
-    rejected_scores = np.array([get_reward_score(ex["rejected"]) for ex in pairs])
+    # — Plot 1: Chosen vs Rejected (mixed Dahoas/full-hh-rlhf) —
+    pairs = load_dataset("Dahoas/full-hh-rlhf", split="train") \
+                .shuffle(seed=42).select(range(100))
+    chosen_scores   = [get_reward_score(ex["chosen"])   for ex in pairs]
+    rejected_scores = [get_reward_score(ex["rejected"]) for ex in pairs]
 
-    plt.figure(figsize=(8, 5))
-
-    # plot KDEs
-    sns.kdeplot(
-        chosen_scores,
-        label="Helpful",
-        fill=True,
-        alpha=0.5,
-        linewidth=2
-    )
-    sns.kdeplot(
-        rejected_scores,
-        label="Harmless",
-        fill=True,
-        alpha=0.5,
-        linewidth=2
-    )
-
-    plt.xlabel("Rewards")
-    plt.ylabel("Density")
-    plt.title("Reward Distribution: Helpful vs. Harmless (with Fair Curiosity)")
+    plt.figure(figsize=(6,4))
+    sns.kdeplot(chosen_scores,   label="Chosen",   fill=True, alpha=0.5, linewidth=2)
+    sns.kdeplot(rejected_scores, label="Rejected", fill=True, alpha=0.5, linewidth=2)
+    plt.title("Reward Distribution: Chosen vs Rejected")
+    plt.xlabel("Reward score"); plt.ylabel("Density")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("reward_distribution_fair_curiosity.png")
+    plt.show()
+
+    # — Plot 2: Helpful vs Harmless (Anthropic splits) —
+    helpful_ds  = load_dataset("Anthropic/hh-rlhf", "helpful-base",  split="train").shuffle(seed=42).select(range(100))
+    harmless_ds = load_dataset("Anthropic/hh-rlhf", "harmless-base", split="train").shuffle(seed=42).select(range(100))
+
+    helpful_scores  = [get_reward_score(ex["chosen"]) for ex in helpful_ds]
+    harmless_scores = [get_reward_score(ex["chosen"]) for ex in harmless_ds]
+
+    plt.figure(figsize=(6,4))
+    sns.kdeplot(helpful_scores,  label="Helpful",  fill=True, alpha=0.5, linewidth=2)
+    sns.kdeplot(harmless_scores, label="Harmless", fill=True, alpha=0.5, linewidth=2)
+    plt.title("Reward Distribution: Helpful vs Harmless")
+    plt.xlabel("Reward score"); plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
     plt.show()
