@@ -1,4 +1,4 @@
-# Recoded Fair Curiosity Model
+# fair reward model using moment matching 
 
 import multiprocessing
 import random
@@ -122,8 +122,8 @@ if __name__ == "__main__":
                 "help": "Path to deepspeed config if using deepspeed. You may need this if the model that you want to train doesn\"t fit on a single GPU."
             },
         )
-        per_device_train_batch_size: Optional[int] = field(default=16)
-        per_device_eval_batch_size: Optional[int] = field(default=16)
+        per_device_train_batch_size: Optional[int] = field(default=32)
+        per_device_eval_batch_size: Optional[int] = field(default=32)
         gradient_accumulation_steps: Optional[int] = field(default=2)
         learning_rate: Optional[float] = field(default=3e-5)
         weight_decay: Optional[float] = field(default=0.001)
@@ -144,7 +144,7 @@ if __name__ == "__main__":
         )
 
         num_train_epochs: Optional[int] = field(
-            default=15,
+            default=5,
             metadata={"help": "The number of training epochs for the reward model."},
         )
         output_path: Optional[str] = field(
@@ -292,6 +292,7 @@ if __name__ == "__main__":
         warmup_ratio=0.03,
         report_to='wandb',
         fp16=script_args.fp16,
+        no_cuda = True,
     )
 
     num_proc = 24
@@ -420,7 +421,7 @@ if __name__ == "__main__":
             return self.net(x)
 
     class RewardTrainer(Trainer):
-        def __init__(self, *args, adv_lambda = 0.6, categories=None, **kwargs):
+        def __init__(self, *args, adv_lambda = 0.1, categories=None, **kwargs):
             super().__init__(*args, **kwargs)
             self.discriminator = Discriminator().to(self.args.device)
             self.optim_d = torch.optim.Adam(self.discriminator.parameters())
@@ -447,7 +448,7 @@ if __name__ == "__main__":
                 self._disc_loss = None
 
             rewards = model(
-                input_ids=inputs["input_ids"].to(self.args.device), attention_mask=inputs["attention_mask"].to(self.args.device)
+                input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
             )[0]
             bsz = rewards.size(0)
             jidx = torch.arange(0, bsz, 2)
@@ -463,7 +464,7 @@ if __name__ == "__main__":
             reward_pair_batch = torch.stack([rewards_j, rewards_k], dim = 1).squeeze()
 
             # for each minibatch, calculate the pairwise moments 
-            disc_features = pairwise_moments(reward_pair_batch, inputs["category"]).to(self.args.device)
+            disc_features = pairwise_moments(reward_pair_batch, inputs["category"])
             loss_adv = 0 
             loss_d = 0
 
@@ -624,6 +625,7 @@ if __name__ == "__main__":
     plt.legend(); plt.tight_layout(); plt.show()
 
 
+    # --- Plot 2: Helpful vs Harmless using Anthropic HH-RLHF splits ---
     ds_helpful  = load_dataset(
         "Anthropic/hh-rlhf",
         split="train[:1000]",

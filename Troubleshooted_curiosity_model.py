@@ -601,6 +601,7 @@ if __name__ == "__main__":
         warmup_ratio=0.03,
         report_to='wandb',
         fp16=script_args.fp16,
+        no_cuda = True,
     )
 
     num_proc = 24
@@ -665,7 +666,7 @@ if __name__ == "__main__":
     import torch
     import torch.nn.functional as F
 
-    class RewardTrainer(Trainer):
+    class FairRewardTrainer(Trainer):
         def __init__(
             self,
             *args,
@@ -752,6 +753,28 @@ if __name__ == "__main__":
                 return loss, {"rewards_j": r_j, "rewards_k": r_k}
             return loss
 
+    class RewardTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            rewards = model(
+                input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
+            )[0]
+            bsz = rewards.size(0)
+            jidx = torch.arange(0, bsz, 2)
+            kidx = jidx + 1
+
+            # j is preferred, k is not 
+            rewards_j = rewards[jidx]
+            rewards_k = rewards[kidx]
+
+            # loss is the bradley terry loss that tries to push likelihood of preferred over not preferred as high as possible 
+
+            # TODO: potential challenge 
+            # advay's fairness loss depends on "logging" certain objects such as embedding clusters, ... + all the RND stuff such as target network/predictor network (advay fill these values in) 
+            loss = -nn.functional.logsigmoid(rewards_j - rewards_k).mean() # + some Fairness loss that depends on advay's code 
+            if return_outputs:
+                return loss, {"rewards_j": rewards_j, "rewards_k": rewards_k}
+            return loss
+
 
 
     embedding_dim = model.config.hidden_size
@@ -767,6 +790,23 @@ if __name__ == "__main__":
 
     fair_curiosity_model = FairnessImbuedCuriosityModel(hp_fair)
 
+    # trainer = RewardTrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset,
+    #     eval_dataset=eval_dataset,
+    #     compute_metrics=compute_metrics,
+    #     data_collator=RewardDataCollatorWithPadding(
+    #         tokenizer=tokenizer,
+    #     ),
+    #     fair_curiosity_model=fair_curiosity_model,
+    #     script_args=script_args,
+    #     callbacks = [KMeansRefitCallback()],
+    #     standardize_curiosity=True,
+    #     cur_buf_size=5000,
+
+    # )
+
     trainer = RewardTrainer(
         model=model,
         args=training_args,
@@ -774,15 +814,9 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         compute_metrics=compute_metrics,
         data_collator=RewardDataCollatorWithPadding(
-            tokenizer=tokenizer,
-        ),
-        fair_curiosity_model=fair_curiosity_model,
-        script_args=script_args,
-        callbacks = [KMeansRefitCallback()],
-        standardize_curiosity=True,
-        cur_buf_size=5000,
-
+            tokenizer=tokenizer),
     )
+
 
 
     

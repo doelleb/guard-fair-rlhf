@@ -1,15 +1,15 @@
-!pip install \
-  torch==2.0.1 \
-  trl==0.7.9 \
-  transformers==4.31.0 \
-  accelerate==0.21.0 \
-  huggingface_hub==0.16.4 \
-  diffusers==0.20.2 \
-  peft==0.4.0 \
-  datasets==2.14.4
+# !pip install \
+#   torch==2.0.1 \
+#   trl==0.7.9 \
+#   transformers==4.31.0 \
+#   accelerate==0.21.0 \
+#   huggingface_hub==0.16.4 \
+#   diffusers==0.20.2 \
+#   peft==0.4.0 \
+#   datasets==2.14.4
 
-#install dependencies
-!pip install bitsandbytes --quiet  # for faster loading
+# #install dependencies
+# !pip install bitsandbytes --quiet  # for faster loading
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_name = "sshleifer/tiny-gpt2"  # super small, fast for demo
@@ -77,6 +77,8 @@ trainer = Trainer(
     train_dataset=tokenized_reward["train"],
     eval_dataset=tokenized_reward["test"],
 )
+
+# 
 trainer.train()
 
 #PPO fine-tuning with TRL
@@ -131,7 +133,8 @@ for prompt in prompts:
     reward_score = torch.tensor([reward.item()])
 
     print(reward_score)
-    ppo_trainer.step([query_tensor[0]], [response_tensor[0]], reward_score)
+    # Use the correct method for PPOTrainer - step method with proper data format
+    ppo_trainer.step([query_tensor[0]], [response_tensor[0]], [reward_score])
 
 #save models
 model.save_pretrained("./ppo_rlhf_baseline")

@@ -5,6 +5,7 @@
 ########################
 
 import multiprocessing
+import sys
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
@@ -69,15 +70,15 @@ if __name__ == "__main__":
         )
 
         num_train_epochs: Optional[int] = field(
-            default=1,
+            default=5,
             metadata={"help": "The number of training epochs for the reward model."},
         )
         train_set_path: Optional[str] = field(
-            default="hendrydong/preference_700K",
+            default="Anthropic/hh-rlhf",
             metadata={"help": "The dir of the subset of the training data to use"},
         )
         eval_set_path: Optional[str] = field(
-            default="hendrydong/preference_700K",
+            default="Anthropic/hh-rlhf",
             metadata={"help": "The dir of the subset of the eval data to use"},
         )
         output_path: Optional[str] = field(
@@ -144,6 +145,7 @@ if __name__ == "__main__":
 
     def build_dataset(tokenizer, train_path, eval_path):
         def tokenize(sample):
+            
             # recursively unwrap lists/tuples until we hit a scalar
             def unwrap(x):
                 while isinstance(x, (list, tuple)) and len(x) > 0:
@@ -152,6 +154,8 @@ if __name__ == "__main__":
 
             pos = unwrap(sample["chosen"])
             neg = unwrap(sample["rejected"])
+ 
+
 
             # coerce to str in case it's not already
             pos = pos if isinstance(pos, str) else str(pos)
@@ -178,6 +182,10 @@ if __name__ == "__main__":
     train_dataset, eval_dataset = build_dataset(tokenizer, train_path, eval_path)
     print(f"Loaded {len(train_dataset)} train examples, {len(eval_dataset)} eval examples")
     print("Training set: ", len(train_dataset), " Eval set: ", len(eval_dataset))
+    print("TRAIN DATASET EXAMPLES:  ")
+    print(train_dataset[0]['chosen'])
+    print(train_dataset[0]['rejected'])
+
 
     # Define the trainer
     training_args = TrainingArguments(
@@ -203,7 +211,8 @@ if __name__ == "__main__":
         optim=script_args.optim,
         lr_scheduler_type=script_args.lr_scheduler_type,
         warmup_ratio=0.03,
-        report_to='wandb'
+        report_to='wandb',
+        no_cuda=True, 
     )
 
 
