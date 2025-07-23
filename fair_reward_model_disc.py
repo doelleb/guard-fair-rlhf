@@ -122,14 +122,14 @@ if __name__ == "__main__":
                 "help": "Path to deepspeed config if using deepspeed. You may need this if the model that you want to train doesn\"t fit on a single GPU."
             },
         )
-        per_device_train_batch_size: Optional[int] = field(default=16)
-        per_device_eval_batch_size: Optional[int] = field(default=16)
+        per_device_train_batch_size: Optional[int] = field(default=64)
+        per_device_eval_batch_size: Optional[int] = field(default=64)
         gradient_accumulation_steps: Optional[int] = field(default=2)
         learning_rate: Optional[float] = field(default=3e-5)
         weight_decay: Optional[float] = field(default=0.001)
 
         model_name: Optional[str] = field(
-            default="erwanf/gpt2-mini",
+            default="meta-llama/Llama-3.2-1B",
             metadata={
                 "help": "The model that you want to train from the Hugging Face hub. E.g. gpt2, gpt2-xl, bert, etc."
             },
@@ -144,7 +144,7 @@ if __name__ == "__main__":
         )
 
         num_train_epochs: Optional[int] = field(
-            default=15,
+            default=10,
             metadata={"help": "The number of training epochs for the reward model."},
         )
         output_path: Optional[str] = field(
@@ -196,8 +196,10 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16 if script_args.bf16 else None,
     )
 
+    print(model.config)
+
     # 1) Resize embeddings *while still on CPU*
-    tokenizer.model_max_length = model.config.n_positions
+    tokenizer.model_max_length = 8192
     model.config.use_cache = not script_args.gradient_checkpointing
     model.config.pad_token_id = tokenizer.pad_token_id
     model.resize_token_embeddings(len(tokenizer))
@@ -463,7 +465,7 @@ if __name__ == "__main__":
             reward_pair_batch = torch.stack([rewards_j, rewards_k], dim = 1).squeeze()
 
             # for each minibatch, calculate the pairwise moments 
-            disc_features = pairwise_moments(reward_pair_batch, inputs["category"]).to(self.args.device)
+            disc_features = pairwise_moments(reward_pair_batch, inputs["category"])
             loss_adv = 0 
             loss_d = 0
 
@@ -472,6 +474,7 @@ if __name__ == "__main__":
 
                 # ----- Adversarial loss (freeze discriminator weights) -----
                 # Temporarily freeze discriminator parameters so gradients do NOT flow into them
+                disc_features[cat] = disc_features[cat].to(self.args.device)
                 was_training = self.discriminator.training
                 self.discriminator.eval()
                 for p in self.discriminator.parameters():
@@ -621,7 +624,7 @@ if __name__ == "__main__":
     plt.fill_between(xs, kde_rejected(xs), alpha=0.3)
     plt.title("Reward Distribution: Chosen vs Rejected")
     plt.xlabel("Reward score"); plt.ylabel("Density")
-    plt.legend(); plt.tight_layout(); plt.show()
+    plt.legend(); plt.tight_layout(); plt.savefig("chosen_rejected.png")
 
 
     ds_helpful  = load_dataset(
@@ -651,4 +654,4 @@ if __name__ == "__main__":
     plt.fill_between(xs, kde_harmless(xs),  alpha=0.3)
     plt.title("Reward Distribution: Helpful vs Harmless (Anthropic HH-RLHF)")
     plt.xlabel("Reward score"); plt.ylabel("Density")
-    plt.legend(); plt.tight_layout(); plt.show()
+    plt.legend(); plt.tight_layout(); plt.savefig("helpful_harmless.png")
