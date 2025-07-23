@@ -11,7 +11,7 @@ wandb.init(project="fair-rlhf-llama3.2", name="baseline_rlhf_llama3.2")
 
 # ===== CONFIGURATION =====
 config = PPOConfig(
-    model_name="meta-llama/Meta-Llama-3-1B",  # Replace w/ LLaMA 3.2 1B if available
+    model_name="meta-llama/Llama-3.2-1B",  # Replace w/ LLaMA 3.2 1B if available
     learning_rate=1e-5,
     batch_size=2,
     mini_batch_size=1,
