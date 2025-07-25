@@ -1,7 +1,8 @@
-#pip install transformers==4.41.1 accelerate==0.30.1 peft==0.11.1 bitsandbytes==0.43.0 datasets==2.19.1 wandb trl==0.8.1
+# pip install transformers==4.41.1 accelerate==0.30.1 peft==0.11.1 bitsandbytes==0.43.0 datasets==2.19.1 wandb trl==0.8.1
+
 import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig
 from datasets import load_dataset
 from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead, set_seed
 import wandb
@@ -27,11 +28,22 @@ set_seed(config.seed)
 tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side="left")
 tokenizer.pad_token = tokenizer.eos_token
 
+# 🛠️ Patch the config before loading
+model_config = AutoConfig.from_pretrained(config.model_name)
+
+# Force rope_scaling to be compatible
+model_config.rope_scaling = {
+    "type": "linear",
+    "factor": 2.0  # You can adjust the factor if needed
+}
+
 model = AutoModelForCausalLMWithValueHead.from_pretrained(
     config.model_name,
+    config=model_config,
     torch_dtype=torch.float16,
     device_map="auto"
 )
+
 
 # ===== REWARD MODEL MOCKUP (replace later with actual reward model) =====
 def reward_fn(sample, response):
