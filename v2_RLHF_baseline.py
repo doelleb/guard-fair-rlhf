@@ -28,7 +28,7 @@ set_seed(config.seed)
 tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side="left")
 tokenizer.pad_token = tokenizer.eos_token
 
-# 🛠️ Patch the config before loading
+# Patch the config before loading
 model_config = AutoConfig.from_pretrained(config.model_name)
 
 # Force rope_scaling to be compatible
@@ -103,4 +103,4 @@ for epoch in range(2):  # Try 2 epochs for demo
 output_dir = "llama3.2_fair_rlhf"
 ppo_trainer.model.save_pretrained(output_dir)
 tokenizer.save_pretrained(output_dir)
-print(f"✅ Model saved to {output_dir}")
+print(f"Model saved to {output_dir}")
