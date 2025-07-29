@@ -25,7 +25,7 @@ from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
 from tqdm import trange
 
 # === Constants and Paths ===
-ACTOR_MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+ACTOR_MODEL_NAME = "meta-llama/Llama-3.2-1B"
 REWARD_BACKBONE = "microsoft/deberta-v3-base"
 OUTPUT_DIR = "./rlhf-demo"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
