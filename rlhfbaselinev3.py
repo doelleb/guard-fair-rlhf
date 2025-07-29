@@ -1,6 +1,6 @@
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 #pip install transformers==4.42.4 trl==0.9.4 accelerate==0.31.0 datasets==2.20.0 peft==0.11.1 bitsandbytes==0.43.1 evaluate==0.4.2 wandb==0.17.7 sentencepiece==0.2.0 protobuf==5.27.2 numpy==1.25.2 matplotlib
-
+#todo: add curiosity, stop it from overusing ram
 
 
 import os
