@@ -130,7 +130,7 @@ print("Reward model trained on HH-RLHF.")
 #    bnb_4bit_compute_dtype=torch.bfloat16,
 #)
 
-bnb_config = none
+bnb_config = None
 
 actor_tokenizer = AutoTokenizer.from_pretrained(os.path.join(OUTPUT_DIR, "sft"), use_fast=False)
 actor_tokenizer.pad_token = actor_tokenizer.eos_token
