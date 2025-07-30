@@ -1,6 +1,7 @@
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 #pip install transformers==4.42.4 trl==0.9.4 accelerate==0.31.0 datasets==2.20.0 peft==0.11.1 bitsandbytes==0.43.1 evaluate==0.4.2 wandb==0.17.7 sentencepiece==0.2.0 protobuf==5.27.2 numpy==1.25.2 matplotlib
-#todo: add curiosity, stop it from overusing ram
+#pip install transformers==4.42.4 trl==0.9.4 accelerate==0.31.0 datasets==2.20.0 peft==0.11.1 bitsandbytes==0.42.0 evaluate==0.4.2 wandb==0.17.7 sentencepiece==0.2.0 protobuf==5.27.2 numpy==1.25.2 matplotlib
+# todo: add curiosity, stop it from overusing ram
 
 
 import os
@@ -30,11 +31,12 @@ REWARD_BACKBONE = "microsoft/deberta-v3-base"
 OUTPUT_DIR = "./rlhf-demo"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-SFT_MAX_SAMPLES = 512
-RM_MAX_SAMPLES = 1000
-PPO_UPDATES = 100
-GEN_MAX_NEW_TOKENS = 128
-MAX_PROMPT_LEN = 512
+SFT_MAX_SAMPLES = 8         # originally 512
+RM_MAX_SAMPLES = 16         # originally 1000
+PPO_UPDATES = 2             # originally 100
+GEN_MAX_NEW_TOKENS = 32     # originally 128
+MAX_PROMPT_LEN = 128        # originally 512
+
 
 # === Device Setup ===
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -95,16 +97,17 @@ reward_model = AutoModelForSequenceClassification.from_pretrained(REWARD_BACKBON
 
 args = TrainingArguments(
     output_dir=os.path.join(OUTPUT_DIR, "rm_hh"),
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=1,
     num_train_epochs=1,
     learning_rate=1e-5,
-    logging_steps=50,
-    save_steps=500,
-    bf16=torch.cuda.is_available(),
+    logging_steps=5,
+    save_steps=99999,  # never save to save disk
+    bf16=False,
     report_to=[],
     remove_unused_columns=False,
 )
+
 
 rm_trainer = PairwiseRewardTrainer(
     model=reward_model,
@@ -114,32 +117,34 @@ rm_trainer = PairwiseRewardTrainer(
 )
 
 rm_trainer.train()
-rm_trainer.save_model(os.path.join(OUTPUT_DIR, "rm_hh"))
-reward_tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "rm_hh"))
+#rm_trainer.save_model(os.path.join(OUTPUT_DIR, "rm_hh"))
+#reward_tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "rm_hh"))
 reward_model.eval().to(device)
 print("Reward model trained on HH-RLHF.")
 
 # === PPO Training ===
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-)
+#bnb_config = BitsAndBytesConfig(
+#    load_in_4bit=True,
+#    bnb_4bit_use_double_quant=True,
+#    bnb_4bit_quant_type="nf4",
+#    bnb_4bit_compute_dtype=torch.bfloat16,
+#)
+
+bnb_config = none
 
 actor_tokenizer = AutoTokenizer.from_pretrained(os.path.join(OUTPUT_DIR, "sft"), use_fast=False)
 actor_tokenizer.pad_token = actor_tokenizer.eos_token
 
 actor_model = AutoModelForCausalLMWithValueHead.from_pretrained(
     os.path.join(OUTPUT_DIR, "sft"),
-    quantization_config=bnb_config,
+    #quantization_config=bnb_config,
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     device_map="auto"
 )
 
 ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
     os.path.join(OUTPUT_DIR, "sft"),
-    quantization_config=bnb_config,
+    #quantization_config=bnb_config,
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     device_map="auto"
 )
@@ -150,12 +155,13 @@ ppo_config = PPOConfig(
     model_name=os.path.join(OUTPUT_DIR, "sft"),
     learning_rate=1e-5,
     mini_batch_size=1,
-    batch_size=8,
-    gradient_accumulation_steps=4,
+    batch_size=2,
+    gradient_accumulation_steps=1,
     target_kl=0.1,
     ppo_epochs=1,
     seed=42,
 )
+
 
 ppo_trainer = PPOTrainer(
     config=ppo_config,
@@ -190,8 +196,8 @@ for step in trange(PPO_UPDATES):
     stats = ppo_trainer.step(query_tensors["input_ids"], response_tensors, torch.tensor(rewards).to(actor_model.device))
     ppo_trainer.log_stats(stats, batch, rewards)
 
-ppo_trainer.model.save_pretrained(os.path.join(OUTPUT_DIR, "ppo_hh"))
-actor_tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "ppo_hh"))
+#ppo_trainer.model.save_pretrained(os.path.join(OUTPUT_DIR, "ppo_hh"))
+#actor_tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "ppo_hh"))
 print("PPO w/ HH-RLHF complete.")
 
 pipe = pipeline(
