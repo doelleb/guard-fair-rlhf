@@ -132,22 +132,21 @@ print("Reward model trained on HH-RLHF.")
 
 bnb_config = None
 
-actor_tokenizer = AutoTokenizer.from_pretrained(os.path.join(OUTPUT_DIR, "sft"), use_fast=False)
+actor_tokenizer = AutoTokenizer.from_pretrained(ACTOR_MODEL_NAME, use_fast=False)
 actor_tokenizer.pad_token = actor_tokenizer.eos_token
 
 actor_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-    os.path.join(OUTPUT_DIR, "sft"),
-    #quantization_config=bnb_config,
+    ACTOR_MODEL_NAME,
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     device_map="auto"
 )
 
 ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-    os.path.join(OUTPUT_DIR, "sft"),
-    #quantization_config=bnb_config,
+    ACTOR_MODEL_NAME,
     torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     device_map="auto"
 )
+
 
 ppo_ds = Dataset.from_dict({"query": prompts})
 
