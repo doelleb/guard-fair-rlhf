@@ -1,0 +1,411 @@
+# Recoded Fair Curiosity Model - FINAL WORKING VERSION (v3)
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+RESULT_DIR = os.path.join(os.getcwd(), "workspace", "algoverse-jtad", "19clssresult")
+os.makedirs(RESULT_DIR, exist_ok=True)
+
+import multiprocessing
+import random
+import logging
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
+import functools
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from datasets import load_dataset
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+import seaborn as sns
+
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    HfArgumentParser,
+    Trainer,
+    TrainingArguments,
+    TrainerCallback,
+    TrainerState,
+    TrainerControl,
+)
+from transformers.utils import PaddingStrategy
+
+import warnings
+warnings.filterwarnings("ignore", message="MiniBatchKMeans is known to have a memory leak on Windows with MKL")
+
+# --- Utility Functions ---
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+# --- Argument Class ---
+@dataclass
+class ScriptArguments:
+    local_rank: Optional[int] = field(default=-1, metadata={"help": "Used for multi-gpu"})
+    deepspeed: Optional[str] = field(default=None, metadata={"help": "Path to deepspeed config."})
+    per_device_train_batch_size: int = field(default=4)
+    per_device_eval_batch_size: int = field(default=4)
+    gradient_accumulation_steps: int = field(default=4)
+    learning_rate: float = field(default=2e-5)
+    weight_decay: float = field(default=0.001)
+    model_name: str = field(default="erwanf/gpt2-mini", metadata={"help": "The model hub name."})
+    bf16: bool = field(default=False, metadata={"help": "Use bfloat16 (not supported by gpt2-mini)."})
+    fp16: bool = field(default=True, metadata={"help": "Use float16."})
+    num_train_epochs: float = field(default=15, metadata={"help": "Number of training epochs."})
+    output_path: str = field(default="./models/pku_fair_rm", metadata={"help": "Output directory for the model."})
+    gradient_checkpointing: bool = field(default=False, metadata={"help": "Enable gradient checkpointing."})
+    optim: str = field(default="adamw_torch", metadata={"help": "The optimizer to use."})
+    lr_scheduler_type: str = field(default="cosine", metadata={"help": "The learning rate scheduler."})
+    max_length: int = field(default=1024, metadata={"help": "Max sequence length for tokenizer."})
+    logging_steps: int = field(default=10)
+    train_size: int = field(default=15000, metadata={"help": "Number of samples to use for training."})
+    eval_size: int = field(default=2500, metadata={"help": "Number of samples to use for evaluation."})
+    adv_lambda: float = field(default=0.0, metadata={"help": "Weight of the adversarial fairness loss."})
+    adv_update_freq: int = field(default=16, metadata={"help": "Steps between discriminator updates."})
+    adv_buffer_size: int = field(default=2048, metadata={"help": "Max rewards per category."})
+    adv_buffer_warmup: int = field(default=128, metadata={"help": "Min rewards in buffer before use."})
+
+# --- Dataset Loading and Processing ---
+def build_dataset(tokenizer, max_length: int, train_size: int, eval_size: int):
+    ds = load_dataset("PKU-Alignment/PKU-SafeRLHF", split="train")
+    original_ds = ds.select(range(train_size, train_size + eval_size))
+
+    def tokenize(sample):
+        if sample["better_response_id"] == 0:
+            j, k = sample["response_0"], sample["response_1"]
+            harm_map_j = sample["response_0_harm_category"]
+        else:
+            j, k = sample["response_1"], sample["response_0"]
+            harm_map_j = sample["response_1_harm_category"]
+
+        full_j = sample["prompt"] + tokenizer.eos_token + j
+        full_k = sample["prompt"] + tokenizer.eos_token + k
+        tok_j = tokenizer(full_j, truncation=True, max_length=max_length, padding=False)
+        tok_k = tokenizer(full_k, truncation=True, max_length=max_length, padding=False)
+
+        return {
+            "input_ids_j": tok_j["input_ids"],
+            "attention_mask_j": tok_j["attention_mask"],
+            "input_ids_k": tok_k["input_ids"],
+            "attention_mask_k": tok_k["attention_mask"],
+            "safety_labels": harm_map_j,
+        }
+
+    tokenized = ds.map(tokenize, remove_columns=ds.column_names, num_proc=multiprocessing.cpu_count())
+    tokenized = tokenized.shuffle(seed=42)
+    train_ds = tokenized.select(range(train_size))
+    eval_ds = tokenized.select(range(train_size, train_size + eval_size))
+    return train_ds, eval_ds, original_ds
+
+# --- Data Collator ---
+@dataclass
+class RewardDataCollatorWithPadding:
+    tokenizer: AutoTokenizer
+    max_length: int
+    padding: Union[bool, str, PaddingStrategy] = "longest"
+    pad_to_multiple_of: Optional[int] = None
+    return_tensors: str = "pt"
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        interleaved = []
+        for f in features:
+            interleaved.append({"input_ids": f["input_ids_j"], "attention_mask": f["attention_mask_j"]})
+            interleaved.append({"input_ids": f["input_ids_k"], "attention_mask": f["attention_mask_k"]})
+        batch = self.tokenizer.pad(
+            interleaved,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
+        )
+        return {
+            "input_ids": batch["input_ids"],
+            "attention_mask": batch["attention_mask"],
+            "safety_labels": [f["safety_labels"] for f in features],
+            "return_loss": True,
+        }
+
+# --- Discriminator Model ---
+class Discriminator(nn.Module):
+    def __init__(self, input_dim: int = 4, num_categories: int = 19):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, num_categories)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+# --- Statistics Helper ---
+def calculate_moments_from_buffer(scores: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    mean = scores.mean()
+    centered = scores - mean
+    var = centered.pow(2).mean()
+    std = (var + eps).sqrt()
+    skew = (centered / std).pow(3).mean()
+    kurt = (centered / std).pow(4).mean() - 3.0
+    return torch.stack([mean, var, skew, kurt])
+
+# --- CORRECTED CALLBACK (v2) ---
+class DiscriminatorUpdateCallback(TrainerCallback):
+    def __init__(self, trainer):
+        self.trainer = trainer
+
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        trainer = self.trainer
+        if state.is_local_process_zero and state.global_step > 0 and \
+           state.global_step % trainer.script_args.adv_update_freq == 0:
+            buffer_feats, buffer_labels = [], []
+            for cat, buf in trainer.buffers.items():
+                if len(buf) > trainer.script_args.adv_buffer_warmup:
+                    scores = torch.tensor(list(buf), device=trainer.args.device)
+                    buffer_feats.append(calculate_moments_from_buffer(scores))
+                    buffer_labels.append(trainer.category_ids[cat])
+            if len(buffer_feats) > 1:
+                buffer_feats = torch.stack(buffer_feats)
+                buffer_labels = torch.tensor(buffer_labels, device=trainer.args.device, dtype=torch.long)
+                trainer.discriminator.train()
+                trainer.optim_d.zero_grad()
+                logits_d = trainer.discriminator(buffer_feats.detach())
+                loss_d = trainer.criterion_d(logits_d, buffer_labels)
+                loss_d.backward()
+                trainer.optim_d.step()
+                trainer.log({"train/loss_d": loss_d.item()})
+
+# --- Custom Trainer ---
+class RewardTrainer(Trainer):
+    def __init__(self, *args, script_args: ScriptArguments, categories: List[str], **kwargs):
+        super().__init__(*args, **kwargs)
+        self.script_args = script_args
+        self.categories = categories
+        self.category_ids = {cat: i for i, cat in enumerate(categories)}
+        self.discriminator = Discriminator(input_dim=4, num_categories=len(categories)).to(self.args.device)
+        self.optim_d = torch.optim.Adam(self.discriminator.parameters(), lr=1e-4)
+        self.criterion_d = nn.CrossEntropyLoss()
+        self.buffers = {cat: deque(maxlen=script_args.adv_buffer_size) for cat in categories}
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        safety_labels = inputs.pop("safety_labels")
+        if "return_loss" in inputs:
+            inputs.pop("return_loss")
+        outputs = model(**inputs)
+        rewards = outputs.logits.squeeze(-1)
+        rj, rk = rewards[::2], rewards[1::2]
+        loss_bt = -F.logsigmoid(rj - rk).mean()
+        adv_term = torch.tensor(0.0, device=self.args.device)
+        batch_cat_rewards = {cat: [] for cat in self.categories}
+        for i, reward in enumerate(rj):
+            for cat, present in safety_labels[i].items():
+                if present:
+                    batch_cat_rewards[cat].append(reward)
+        live_feats, live_labels = [], []
+        for cat, cat_rewards in batch_cat_rewards.items():
+            if len(cat_rewards) > 1:
+                scores = torch.stack(cat_rewards)
+                live_feats.append(calculate_moments_from_buffer(scores))
+                live_labels.append(self.category_ids[cat])
+        if len(live_feats) > 1:
+            for p in self.discriminator.parameters():
+                p.requires_grad_(False)
+            self.discriminator.eval()
+            live_feats = torch.stack(live_feats)
+            adv_logits = self.discriminator(live_feats)
+            probs = F.softmax(adv_logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
+            adv_term = -entropy
+            self.log({"train/adv_entropy": entropy.item()})
+            for p in self.discriminator.parameters():
+                p.requires_grad_(True)
+        total_loss = loss_bt + self.script_args.adv_lambda * adv_term
+        with torch.no_grad():
+            for i, reward in enumerate(rj):
+                for cat, present in safety_labels[i].items():
+                    if present:
+                        self.buffers[cat].append(reward.item())
+        return (total_loss, {"rewards_j": rj, "rewards_k": rk}) if return_outputs else total_loss
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    parser = HfArgumentParser(ScriptArguments)
+    script_args, = parser.parse_args_into_dataclasses()
+    set_seed(42)
+
+    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, use_fast=False)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        script_args.model_name,
+        num_labels=1,
+        torch_dtype=torch.bfloat16 if script_args.bf16 else torch.float32,
+    )
+
+    max_pos = model.config.n_positions
+    if script_args.max_length > max_pos:
+        print(f"⚠️  Reducing max_length from {script_args.max_length} to {max_pos}")
+        script_args.max_length = max_pos
+
+    model.resize_token_embeddings(len(tokenizer))
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.use_cache = False
+
+    if script_args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    train_dataset, eval_dataset, orig_eval = build_dataset(
+        tokenizer, script_args.max_length, script_args.train_size, script_args.eval_size
+    )
+    harm_categories = list(load_dataset("PKU-Alignment/PKU-SafeRLHF", split="train")[0]['response_0_harm_category'].keys())
+
+    training_args = TrainingArguments(
+        output_dir=script_args.output_path,
+        learning_rate=script_args.learning_rate,
+        per_device_train_batch_size=script_args.per_device_train_batch_size,
+        per_device_eval_batch_size=script_args.per_device_eval_batch_size,
+        num_train_epochs=script_args.num_train_epochs,
+        weight_decay=script_args.weight_decay,
+        gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+        gradient_checkpointing=script_args.gradient_checkpointing,
+        deepspeed=script_args.deepspeed,
+        local_rank=script_args.local_rank,
+        remove_unused_columns=False,
+        label_names=[],
+        bf16=script_args.bf16,
+        fp16=script_args.fp16,
+        logging_strategy="steps",
+        logging_steps=script_args.logging_steps,
+        optim=script_args.optim,
+        lr_scheduler_type=script_args.lr_scheduler_type,
+        warmup_ratio=0.03,
+        report_to="wandb",
+        run_name=f"fair-rm-{script_args.model_name.split('/')[-1]}-lambda{script_args.adv_lambda}",
+    )
+    
+    trainer = RewardTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=RewardDataCollatorWithPadding(tokenizer=tokenizer, max_length=script_args.max_length),
+        categories=harm_categories,
+        script_args=script_args,
+    )
+    trainer.add_callback(DiscriminatorUpdateCallback(trainer))
+
+    print("Starting reward-model training...")
+    trainer.train()
+
+    print("Saving final model checkpoint...")
+    trainer.save_model(script_args.output_path)
+    tokenizer.save_pretrained(script_args.output_path)
+
+    # =================================================================================
+    # CORRECTED: The entire plotting section is now inside the main execution block,
+    # so it has access to `model`, `trainer`, `tokenizer`, etc.
+    # =================================================================================
+    
+    # --- Evaluation & Plotting (with Over/Under-sampling for Fair Comparison) ---
+    print("Generating evaluation plots...")
+    model.eval()
+    device = trainer.args.device
+
+    TARGET_SAMPLE_SIZE = 100
+
+    def get_reward_score(text: str) -> float:
+        if not text: text = tokenizer.pad_token
+        enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=script_args.max_length)
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            out = model(**enc).logits.squeeze()
+        return out.cpu().float().item()
+
+    print(f"Calculating and resampling per-category scores to n={TARGET_SAMPLE_SIZE}...")
+    resampled_scores = {}
+    for cat in harm_categories:
+        def filter_by_category(example, category_to_check: str):
+            return example["response_0_harm_category"][category_to_check] or example["response_1_harm_category"][category_to_check]
+        filter_fn = functools.partial(filter_by_category, category_to_check=cat)
+        num_procs = min(multiprocessing.cpu_count(), 4) if len(orig_eval) > 1000 else 1
+        samples = orig_eval.filter(filter_fn, num_proc=num_procs)
+        
+        if len(samples) < 2:
+            print(f"  - Skipping category '{cat}': only {len(samples)} sample(s) found. Not enough to plot.")
+            continue
+        
+        def map_fn(sample, tokenizer_arg):
+            chosen = sample['response_0'] if sample['better_response_id']==0 else sample['response_1']
+            return {"text_j": sample['prompt'] + tokenizer_arg.eos_token + chosen}
+        
+        texts = samples.map(functools.partial(map_fn, tokenizer_arg=tokenizer), num_proc=num_procs)
+        scores = np.array([get_reward_score(t) for t in texts["text_j"]])
+        
+        np.random.seed(42)
+        
+        if len(scores) >= TARGET_SAMPLE_SIZE:
+            print(f"  + Subsampling '{cat}': found {len(scores)} samples, taking {TARGET_SAMPLE_SIZE}.")
+            resampled_scores[cat] = np.random.choice(scores, TARGET_SAMPLE_SIZE, replace=False)
+        else:
+            print(f"  + Oversampling '{cat}': found {len(scores)} samples, boosting to {TARGET_SAMPLE_SIZE}.")
+            resampled_scores[cat] = np.random.choice(scores, TARGET_SAMPLE_SIZE, replace=True)
+
+    if resampled_scores:
+        all_s = np.concatenate(list(resampled_scores.values()))
+        xs = np.linspace(all_s.min(), all_s.max(), 300)
+        plt.figure(figsize=(12, 8))
+        sns.set_theme(style="whitegrid")
+        
+        for cat, scores in resampled_scores.items():
+            kde = gaussian_kde(scores)
+            plt.plot(xs, kde(xs), label=f"{cat} (n={TARGET_SAMPLE_SIZE})")
+            
+        plt.title(f"Reward-Score Distributions by Harm Category (Resampled to n={TARGET_SAMPLE_SIZE})")
+        plt.xlabel("Reward Score")
+        plt.ylabel("Density")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULT_DIR, "reward_dist_by_category_resampled.png"))
+        plt.close()
+    else:
+        print("No categories had enough samples to generate the per-category plot.")
+
+    print("Calculating chosen vs. rejected scores...")
+    def map_fn2(sample, tokenizer_arg):
+        if sample['better_response_id']==0:
+            c,r = sample['response_0'], sample['response_1']
+        else:
+            c,r = sample['response_1'], sample['response_0']
+        return {"text_j": sample['prompt']+tokenizer_arg.eos_token+c,
+                "text_k": sample['prompt']+tokenizer_arg.eos_token+r}
+
+    num_procs_map2 = min(multiprocessing.cpu_count(), 4) if len(orig_eval) > 1000 else 1
+    text_pairs = orig_eval.map(functools.partial(map_fn2, tokenizer_arg=tokenizer), num_proc=num_procs_map2)
+    chosen = np.array([get_reward_score(t) for t in text_pairs['text_j']])
+    rejected = np.array([get_reward_score(t) for t in text_pairs['text_k']])
+
+    if len(chosen)>1 and len(rejected)>1:
+        xs = np.linspace(min(chosen.min(),rejected.min()), max(chosen.max(),rejected.max()),300)
+        kde_c = gaussian_kde(chosen)
+        kde_r = gaussian_kde(rejected)
+        plt.figure(figsize=(8,5))
+        plt.plot(xs, kde_c(xs), label="Chosen")
+        plt.fill_between(xs, kde_c(xs), alpha=0.3)
+        plt.plot(xs, kde_r(xs), label="Rejected")
+        plt.fill_between(xs, kde_r(xs), alpha=0.3)
+        plt.title("Reward Distribution: Chosen vs Rejected")
+        plt.xlabel("Reward Score")
+        plt.ylabel("Density")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULT_DIR, "chosen_rejected_dist.png"))
+        plt.close()
+
+    print("Script finished successfully.")
