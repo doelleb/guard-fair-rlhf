@@ -1,5 +1,5 @@
 #pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-#pip install transformers==4.42.4 trl==0.9.4 accelerate==0.31.0 datasets==2.20.0 peft==0.11.1 bitsandbytes==0.43.1 evaluate==0.4.2 wandb==0.17.7 sentencepiece==0.2.0 protobuf==5.27.2 numpy==1.25.2 matplotlib
+#pip install transformers==4.42.4 trl==0.9.4 accelerate==0.31.0 datasets==2.20.0 peft==0.11.1 bitsandbytes==0.43.1 evaluate==0.4.2 wandb==0.17.7 sentencepiece==0.2.0 protobuf==5.27.2 numpy==1.25.2 matplotlib scikit-learn sentencepiece
 #todo: add curiosity, stop it from overusing ram
 
 
@@ -319,7 +319,8 @@ else:
         num_train_epochs=1,
         learning_rate=1e-5,
         logging_steps=5,
-        save_steps=99999,  # never save to save disk
+        save_steps=1000,  # never save to save disk
+        save_total_limit=2
         bf16=False,
         report_to=[],
         remove_unused_columns=False,
