@@ -293,31 +293,7 @@ class PairwiseRewardTrainer(Trainer):
 reward_model_save_path = f"{OUTPUT_DIR}/rm_hh"
 os.makedirs(reward_model_save_path, exist_ok=True)
 
-if os.path.exists(reward_model_save_path):
-    reward_model = AutoModelForSequenceClassification.from_pretrained(reward_model_save_path).to(device)
-    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_save_path)
-else:
-    reward_model = AutoModelForSequenceClassification.from_pretrained(REWARD_BACKBONE, num_labels=1).to(device)
-    args = TrainingArguments(
-        output_dir=reward_model_save_path,
-        per_device_train_batch_size=1,
-        num_train_epochs=1,
-        learning_rate=1e-5,
-        logging_steps=5,
-        save_steps=1000,
-        save_total_limit=2,
-        report_to=[],
-        remove_unused_columns=False,
-    )
-    rm_trainer = PairwiseRewardTrainer(
-        model=reward_model,
-        args=args,
-        train_dataset=tokenized_rm,
-        data_collator=PairwiseCollator(reward_tokenizer),
-    )
-    rm_trainer.train()
-    rm_trainer.save_model(reward_model_save_path)
-    reward_tokenizer.save_pretrained(reward_model_save_path)
+reward_model = AutoModelForSequenceClassification.from_pretrained("gpt2", num_labels=1).to(device)
 
 # === Load Actor + Ref Model with RoPE Patch ===
 import transformers.models.llama.configuration_llama as llama_config
