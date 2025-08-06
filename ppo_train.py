@@ -299,13 +299,13 @@ reward_model = AutoModelForSequenceClassification.from_pretrained("gpt2", num_la
 import transformers.models.llama.configuration_llama as llama_config
 #original_rope_validation = llama_config.LlamaConfig._rope_scaling_validation
 
-# def patched_rope_validation(self):
-#     if self.rope_scaling is not None and isinstance(self.rope_scaling, dict):
-#         if 'rope_type' in self.rope_scaling:
-#             factor = self.rope_scaling.get('factor', 1.0)
-#             self.rope_scaling = { 'type': 'linear', 'factor': factor }
+def patched_rope_validation(self):
+    if self.rope_scaling is not None and isinstance(self.rope_scaling, dict):
+         if 'rope_type' in self.rope_scaling:
+             factor = self.rope_scaling.get('factor', 1.0)
+             self.rope_scaling = { 'type': 'linear', 'factor': factor }
 
-# llama_config.LlamaConfig._rope_scaling_validation = patched_rope_validation
+llama_config.LlamaConfig._rope_scaling_validation = patched_rope_validation
 
 actor_tokenizer = AutoTokenizer.from_pretrained(ACTOR_MODEL_NAME, use_fast=False)
 actor_tokenizer.pad_token = actor_tokenizer.eos_token
