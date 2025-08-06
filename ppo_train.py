@@ -179,22 +179,29 @@ class IntrinsicCuriosityModel:
         )
         self.visit_counts = np.zeros(hp.num_clusters)
 
-    def get_embeddings(self, texts: List[str], model, tokenizer) -> np.ndarray:
-        """Extract embeddings from the model for given texts"""
-        embeddings = []
-        for text in texts:
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = model(**inputs, output_hidden_states=True)
-
-                # Use the last hidden state and take mean over sequence length
-                hidden_states = outputs[-1]  # Shape: (batch_size, seq_len, hidden_dim)
-                embedding = hidden_states.mean(dim=1).cpu().numpy()  # Shape: (batch_size, hidden_dim)
-                embeddings.append(embedding[0])  # Take first (and only) element
+def get_embeddings(self, texts: List[str], model, tokenizer) -> np.ndarray:
+    """Extract embeddings from the model for given texts"""
+    embeddings = []
+    for text in texts:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}  # Use self.device instead of global device
         
-        return np.array(embeddings)
+        with torch.no_grad():
+            # For AutoModelForCausalLMWithValueHead, we need to access the base model
+            if hasattr(model, 'pretrained_model'):
+                outputs = model.pretrained_model(**inputs, output_hidden_states=True)
+            else:
+                outputs = model(**inputs, output_hidden_states=True)
+            
+            # Get the hidden states - this should be a tuple of hidden states
+            hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
+            # Shape: (batch_size, seq_len, hidden_dim)
+            
+            # Take mean pooling over sequence length
+            embedding = hidden_states.mean(dim=1).cpu().numpy()  # Shape: (batch_size, hidden_dim)
+            embeddings.append(embedding[0])  # Take first (and only) element
+    
+    return np.array(embeddings)
 
     def compute_intrinsic_reward(self, texts: List[str], model, tokenizer) -> List[float]:
         """Compute intrinsic curiosity rewards for given texts"""
@@ -319,7 +326,9 @@ ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
 
 # === Initialize Curiosity ===
 curiosity_model = IntrinsicCuriosityModel(CuriosityHyperparameters(
-    embedding_dim=768, alpha_curiosity=0.1, device=device
+    embedding_dim=2048,  # Changed from 768 to 2048 for Llama 3.2-1B
+    alpha_curiosity=0.1, 
+    device=device
 ))
 
 ppo_ds = Dataset.from_dict({"query": prompts})
