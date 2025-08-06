@@ -23,7 +23,7 @@ from transformers import (
     BitsAndBytesConfig,
     AutoModelForCausalLM
 )
-from trl import PPOv2Config, PPOv2Trainer, AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
+from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 from tqdm import trange
 from sklearn.cluster import MiniBatchKMeans
 
