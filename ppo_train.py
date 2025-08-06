@@ -185,22 +185,22 @@ class IntrinsicCuriosityModel:
         for text in texts:
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}  # Use self.device instead of global device
-            
+        
             with torch.no_grad():
                 # For AutoModelForCausalLMWithValueHead, we need to access the base model
                 if hasattr(model, 'pretrained_model'):
                     outputs = model.pretrained_model(**inputs, output_hidden_states=True)
                 else:
                     outputs = model(**inputs, output_hidden_states=True)
-                
+            
                 # Get the hidden states - this should be a tuple of hidden states
                 hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
                 # Shape: (batch_size, seq_len, hidden_dim)
-                
-                # Take mean pooling over sequence length
-                embedding = hidden_states.mean(dim=1).cpu().numpy()  # Shape: (batch_size, hidden_dim)
+            
+                # Convert to float32 first, then take mean pooling over sequence length
+                embedding = hidden_states.float().mean(dim=1).cpu().numpy()  # Shape: (batch_size, hidden_dim)
                 embeddings.append(embedding[0])  # Take first (and only) element
-        
+    
         return np.array(embeddings)
 
     def compute_intrinsic_reward(self, texts: List[str], model, tokenizer) -> List[float]:
