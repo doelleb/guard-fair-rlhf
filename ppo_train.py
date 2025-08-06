@@ -372,7 +372,8 @@ for step in trange(PPO_UPDATES):
     stats = ppo_trainer.step(list(inputs["input_ids"]), list(responses), [torch.tensor(rewards).to(device)])
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
     stats["ppo/epoch"] = step
-    stats["env/reward_mean"] = np.mean(rewards)  # Add this line
+    stats["env/reward_mean"] = np.mean(rewards)
+    stats["env/reward_std"] = np.std(rewards)
     ppo_trainer.stats_history.append(stats)
     print(stats, batch, rewards)
     ppo_trainer.log_stats(stats, batch, rewards)
