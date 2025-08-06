@@ -447,3 +447,7 @@ if "env/response_length_mean" in stats.columns:
     plt.grid(True)
     plt.legend()
     plt.show() 
+
+import shutil
+shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+
