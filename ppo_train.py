@@ -350,8 +350,8 @@ reward_tokenizer.padding_side = "right"
 def compute_reward(prompts, responses):
     toks = reward_tokenizer(responses, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
     scores = reward_model(**toks).logits.squeeze(-1).detach().cpu().tolist()
-    #curiosity = curiosity_model.compute_intrinsic_reward(responses, actor_model, actor_tokenizer)
-    #return [e + i for e, i in zip(scores, curiosity)]
+    curiosity = curiosity_model.compute_intrinsic_reward(responses, actor_model, actor_tokenizer)
+    return [e + i for e, i in zip(scores, curiosity)]
     return scores
 
 gen_kwargs = dict(
