@@ -151,17 +151,27 @@ class ClusterManager:
         self.warmup_samples = warmup
         self.batch_size = batch
         self.interval = interval
-        self.kmeans = MiniBatchKMeans(n_clusters=num, batch_size=batch)
+        self.kmeans = MiniBatchKMeans(n_clusters=num, batch_size=batch, random_state=42)
         self.visit_counts = np.zeros(num)
         self.samples_seen = 0
+        self.is_fitted = False
 
     def update(self, collector: EmbeddingCollector):
         embs = collector.all()
-        if len(embs) >= self.warmup_samples and self.samples_seen % self.interval == 0:
-            self.kmeans.partial_fit(embs)
+        if len(embs) >= self.warmup_samples:
+            if not self.is_fitted:
+                # Initial fit with enough samples
+                self.kmeans.fit(embs)
+                self.is_fitted = True
+            elif self.samples_seen % self.interval == 0:
+                # Partial fit for updates
+                self.kmeans.partial_fit(embs)
         self.samples_seen += 1
 
     def assign(self, emb: np.ndarray) -> int:
+        if not self.is_fitted:
+            # Return random cluster if not fitted yet
+            return np.random.randint(0, self.num_clusters)
         return self.kmeans.predict(emb.reshape(1, -1))[0]
 
     def visit(self, cid: int):
