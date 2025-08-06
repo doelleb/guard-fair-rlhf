@@ -371,6 +371,7 @@ for step in trange(PPO_UPDATES):
     rewards = compute_reward(queries, decoded)
     stats = ppo_trainer.step(list(inputs["input_ids"]), list(responses), [torch.tensor(rewards).to(device)])
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
+    stats["ppo/epoch"] = step  # <-- add epoch number manually
     ppo_trainer.stats_history.append(stats)
     print(stats, batch, rewards)
     ppo_trainer.log_stats(stats, batch, rewards)
