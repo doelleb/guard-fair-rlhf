@@ -445,6 +445,8 @@ gen_kwargs = dict(
 
 # Replace the PPO training loop section (around lines 450-480) with this fixed version:
 
+# Replace the PPO training loop section with this fixed version:
+
 print("\n" + "="*80)
 print("STARTING CURIOSITY PPO FINE-TUNING")
 print("="*80)
@@ -475,13 +477,27 @@ for step in trange(PPO_UPDATES):
             **gen_kwargs
         )
         
-        # Ensure response tensor is also on correct device
+        # Handle response tensor properly - it should be a 2D tensor from generate()
         if isinstance(response_tensor, list):
             response_tensor = response_tensor[0]
+        
+        # Extract the 1D tensor (remove batch dimension if present)
+        if response_tensor.dim() > 1:
+            response_tensor = response_tensor[0]  # Remove batch dimension
+        
         response_tensors.append(response_tensor.to(device))
     
-    # Decode the responses
-    decoded = actor_tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+    # Decode the responses - convert tensors to lists of integers
+    response_token_lists = []
+    for tensor in response_tensors:
+        if tensor.dim() == 0:  # If it's a scalar, make it a list
+            token_list = [tensor.item()]
+        else:  # If it's a 1D tensor
+            token_list = tensor.cpu().tolist()  # Convert to list of integers
+        response_token_lists.append(token_list)
+    
+    # Now decode properly
+    decoded = actor_tokenizer.batch_decode(response_token_lists, skip_special_tokens=True)
     
     # Compute rewards
     rewards = compute_reward(queries, decoded)
