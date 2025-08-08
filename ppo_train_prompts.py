@@ -448,7 +448,6 @@ print("STARTING CURIOSITY PPO FINE-TUNING")
 print("="*80)
 
 for step in trange(PPO_UPDATES):
-    for step in trange(PPO_UPDATES):
     batch = next(iter(ppo_trainer.dataloader))
     query = batch["query"][0] if isinstance(batch["query"], list) else batch["query"]
     
