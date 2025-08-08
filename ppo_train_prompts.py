@@ -449,16 +449,41 @@ print("="*80)
 
 for step in trange(PPO_UPDATES):
     batch = next(iter(ppo_trainer.dataloader))
-    query = batch["query"][0] if isinstance(batch["query"], list) else batch["query"]
     
-    inputs = actor_tokenizer(query, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN).to(device)
+    # Handle batch properly - extract the query strings
+    if isinstance(batch["query"], list):
+        queries = batch["query"]
+    else:
+        queries = [batch["query"]]
     
-    response_tensors = ppo_trainer.generate(inputs["input_ids"], return_prompt=False, **gen_kwargs)
+    # Process each query in the batch
+    query_tensors = []
+    response_tensors = []
+    
+    for query in queries:
+        # Tokenize the query
+        inputs = actor_tokenizer(query, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
+        query_tensor = inputs["input_ids"][0]  # Extract the 1D tensor
+        query_tensors.append(query_tensor)
+        
+        # Generate response using the correct format
+        response_tensor = ppo_trainer.generate(
+            query_tensor,  # Pass the 1D tensor directly
+            return_prompt=False, 
+            **gen_kwargs
+        )
+        response_tensors.append(response_tensor[0])  # Extract the response part
+    
+    # Decode the responses
     decoded = actor_tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
     
-    rewards = compute_reward([query], decoded)
+    # Compute rewards
+    rewards = compute_reward(queries, decoded)
     
-    stats = ppo_trainer.step([inputs["input_ids"][0]], response_tensors, rewards)
+    # PPO step
+    stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+    
+    # Clean up stats (remove list entries that can't be logged)
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
     stats["ppo/epoch"] = step
     stats["env/reward_mean"] = np.mean(rewards)
