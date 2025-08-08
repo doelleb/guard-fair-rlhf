@@ -37,7 +37,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 SFT_MAX_SAMPLES = 4
 RM_MAX_SAMPLES = 8
 PPO_UPDATES = 100
-GEN_MAX_NEW_TOKENS = 50  # Increased for better demonstration
+GEN_MAX_NEW_TOKENS = 75  # Increased for better demonstration
 MAX_PROMPT_LEN = 256
 
 # === Define Test Harmful Prompts ===
@@ -97,23 +97,23 @@ def test_harmful_prompts(model, tokenizer, device, model_name="Model"):
 
 @dataclass
 class CuriosityHyperparameters:
-    embedding_dim: int = 768
-    num_clusters: int = 10
-    learning_rate: float = 1e-3
-    rnd_output_dim: int = 64
-    rnd_ensemble_count: int = 2
-    warmup_samples: int = 50
-    cluster_batch_size: int = 32
-    recluster_interval: int = 50
-    reward_norm_beta: float = 0.01
-    fairness_lambda: float = 0.1
-    mi_buffer_size: int = 10000
-    alpha_curiosity: float = 0.1
-    device: str = "cpu"
-    verbose: bool = False
-    fairness_boost_dynamic_scale: bool = False
-    fairness_boost_scale_factor: float = 1.0
-    boltzmann_beta: float = 5.0
+    embedding_dim: int = 2048
+    num_clusters: int = 20
+    learning_rate: float = 5e-4
+    rnd_output_dim: int = 128
+    rnd_ensemble_count: int = 3
+    warmup_samples: int = 100
+    cluster_batch_size: int = 64
+    recluster_interval: int = 25
+    reward_norm_beta: float = 0.02
+    fairness_lambda: float = 0.15
+    mi_buffer_size: int = 15000
+    alpha_curiosity: float = 0.05
+    device: str = "gpu"
+    verbose: bool = True
+    fairness_boost_dynamic_scale: bool = True
+    fairness_boost_scale_factor: float = 1.5
+    boltzmann_beta: float = 3.0
     seed: int = 42
 
 # === Curiosity Components ===
@@ -306,7 +306,7 @@ class IntrinsicCuriosityModel:
         return rewards
 
 # === Device Setup ===
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "gpu"
 print("Device:", device)
 if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.9)
@@ -411,11 +411,11 @@ ppo_ds = Dataset.from_dict({"query": prompts})
 ppo_config = PPOConfig(
     model_name=ACTOR_MODEL_NAME,
     learning_rate=1e-5,
-    mini_batch_size=1,
-    batch_size=1,
-    gradient_accumulation_steps=1,
-    target_kl=0.1,
-    ppo_epochs=1,
+    mini_batch_size=2,
+    batch_size=4,
+    gradient_accumulation_steps=2,
+    target_kl=0.05,
+    ppo_epochs=2,
     seed=42,
 )
 ppo_trainer = PPOTrainer(
@@ -439,7 +439,7 @@ def compute_reward(prompts, responses):
 
 gen_kwargs = dict(
     max_new_tokens=GEN_MAX_NEW_TOKENS, do_sample=True,
-    top_k=50, top_p=0.95, temperature=1.0,
+    top_k=40, top_p=0.9, temperature=0.8,
     pad_token_id=actor_tokenizer.eos_token_id
 )
 
