@@ -306,7 +306,7 @@ class IntrinsicCuriosityModel:
         return rewards
 
 # === Device Setup ===
-device = "cuda" if torch.cuda.is_available() else "gpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"  # Change "gpu" to "cpu"
 print("Device:", device)
 if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.9)
@@ -412,7 +412,7 @@ ppo_config = PPOConfig(
     model_name=ACTOR_MODEL_NAME,
     learning_rate=1e-5,
     mini_batch_size=2,
-    batch_size=4,
+    batch_size=1,
     gradient_accumulation_steps=2,
     target_kl=0.05,
     ppo_epochs=2,
@@ -448,13 +448,18 @@ print("STARTING CURIOSITY PPO FINE-TUNING")
 print("="*80)
 
 for step in trange(PPO_UPDATES):
+    for step in trange(PPO_UPDATES):
     batch = next(iter(ppo_trainer.dataloader))
-    queries = batch["query"]
-    inputs = actor_tokenizer(queries, padding=True, truncation=True, max_length=MAX_PROMPT_LEN, return_tensors="pt").to(device)
-    responses = ppo_trainer.generate(inputs["input_ids"][0], **gen_kwargs)
-    decoded = actor_tokenizer.batch_decode(responses[:, inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
-    rewards = compute_reward(queries, decoded)
-    stats = ppo_trainer.step(list(inputs["input_ids"]), list(responses), [torch.tensor(rewards).to(device)])
+    query = batch["query"][0] if isinstance(batch["query"], list) else batch["query"]
+    
+    inputs = actor_tokenizer(query, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN).to(device)
+    
+    response_tensors = ppo_trainer.generate(inputs["input_ids"], return_prompt=False, **gen_kwargs)
+    decoded = actor_tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+    
+    rewards = compute_reward([query], decoded)
+    
+    stats = ppo_trainer.step([inputs["input_ids"][0]], response_tensors, rewards)
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
     stats["ppo/epoch"] = step
     stats["env/reward_mean"] = np.mean(rewards)
