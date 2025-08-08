@@ -443,6 +443,8 @@ gen_kwargs = dict(
     pad_token_id=actor_tokenizer.eos_token_id
 )
 
+# Replace the PPO training loop section (around lines 450-480) with this fixed version:
+
 print("\n" + "="*80)
 print("STARTING CURIOSITY PPO FINE-TUNING")
 print("="*80)
@@ -461,18 +463,22 @@ for step in trange(PPO_UPDATES):
     response_tensors = []
     
     for query in queries:
-        # Tokenize the query
+        # Tokenize the query and move to device
         inputs = actor_tokenizer(query, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
-        query_tensor = inputs["input_ids"][0]  # Extract the 1D tensor
+        query_tensor = inputs["input_ids"][0].to(device)  # Move to device!
         query_tensors.append(query_tensor)
         
         # Generate response using the correct format
         response_tensor = ppo_trainer.generate(
-            query_tensor,  # Pass the 1D tensor directly
+            query_tensor,  # Pass the 1D tensor on correct device
             return_prompt=False, 
             **gen_kwargs
         )
-        response_tensors.append(response_tensor[0])  # Extract the response part
+        
+        # Ensure response tensor is also on correct device
+        if isinstance(response_tensor, list):
+            response_tensor = response_tensor[0]
+        response_tensors.append(response_tensor.to(device))
     
     # Decode the responses
     decoded = actor_tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
@@ -480,7 +486,7 @@ for step in trange(PPO_UPDATES):
     # Compute rewards
     rewards = compute_reward(queries, decoded)
     
-    # PPO step
+    # PPO step - ensure all tensors are on the same device
     stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
     
     # Clean up stats (remove list entries that can't be logged)
