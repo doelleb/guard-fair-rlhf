@@ -439,9 +439,9 @@ def compute_regular_reward(prompts, responses):
         toks = reward_model_tokenizer(response, truncation=True, max_length=256, 
                                     return_tensors="pt", padding=False).to(device)
         with torch.no_grad():
-            score = reward_model(**toks).logits.squeeze(-1).detach().cpu().item()
+            score = reward_model(**toks).logits.squeeze(-1).detach()
         scores.append(score)
-    return scores
+    return scores  # Return list of tensors, not floats
 
 # Create PPO trainer for regular PPO
 ppo_trainer = PPOTrainer(
@@ -519,8 +519,10 @@ for step in trange(PPO_REGULAR_UPDATES):
     # Clean up stats
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
     stats["ppo/epoch"] = step
-    stats["env/reward_mean"] = np.mean(rewards)
-    stats["env/reward_std"] = np.std(rewards)
+    # Convert tensor rewards to floats for logging
+    reward_values = [r.item() if torch.is_tensor(r) else r for r in rewards]
+    stats["env/reward_mean"] = np.mean(reward_values)
+    stats["env/reward_std"] = np.std(reward_values)
     stats["training_stage"] = "regular_ppo"
     ppo_trainer.stats_history.append(stats)
     
@@ -565,11 +567,16 @@ def compute_curiosity_reward(prompts, responses):
         toks = reward_model_tokenizer(response, truncation=True, max_length=256, 
                                     return_tensors="pt", padding=False).to(device)
         with torch.no_grad():
-            score = reward_model(**toks).logits.squeeze(-1).detach().cpu().item()
+            score = reward_model(**toks).logits.squeeze(-1).detach()
         scores.append(score)
     
     curiosity = curiosity_model.compute_intrinsic_reward(responses, actor_model, actor_tokenizer)
-    return [e + i for e, i in zip(scores, curiosity)]
+    # Convert curiosity rewards to tensors and combine
+    combined_rewards = []
+    for score, curiosity_reward in zip(scores, curiosity):
+        combined_reward = score + torch.tensor(curiosity_reward, device=device)
+        combined_rewards.append(combined_reward)
+    return combined_rewards
 
 # Continue training with curiosity
 for step in trange(PPO_CURIOSITY_UPDATES):
@@ -627,8 +634,10 @@ for step in trange(PPO_CURIOSITY_UPDATES):
     # Clean up stats
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
     stats["ppo/epoch"] = PPO_REGULAR_UPDATES + step
-    stats["env/reward_mean"] = np.mean(rewards)
-    stats["env/reward_std"] = np.std(rewards)
+    # Convert tensor rewards to floats for logging
+    reward_values = [r.item() if torch.is_tensor(r) else r for r in rewards]
+    stats["env/reward_mean"] = np.mean(reward_values)
+    stats["env/reward_std"] = np.std(reward_values)
     stats["training_stage"] = "curiosity_ppo"
     ppo_trainer.stats_history.append(stats)
     
