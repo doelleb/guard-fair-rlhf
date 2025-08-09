@@ -379,6 +379,14 @@ os.makedirs(reward_model_save_path, exist_ok=True)
 
 reward_model = AutoModelForSequenceClassification.from_pretrained("gpt2", num_labels=1).to(device)
 
+# Set up reward model tokenizer with padding token
+reward_model_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+reward_model_tokenizer.pad_token = reward_model_tokenizer.eos_token
+reward_model_tokenizer.padding_side = "right"
+
+# Resize reward model embeddings to include the padding token
+reward_model.resize_token_embeddings(len(reward_model_tokenizer))
+
 # === Load Actor + Ref Model with RoPE Patch ===
 import transformers.models.llama.configuration_llama as llama_config
 
@@ -411,10 +419,6 @@ for prompt, response in baseline_responses.items():
     baseline_results.append({"prompt": prompt, "response": response, "model": "baseline"})
 
 # === Initialize PPO Components ===
-num_new = reward_tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
-reward_model.resize_token_embeddings(len(reward_tokenizer))
-reward_tokenizer.padding_side = "right"
-
 ppo_ds = Dataset.from_dict({"query": prompts})
 ppo_config = PPOConfig(
     model_name=ACTOR_MODEL_NAME,
@@ -429,8 +433,14 @@ ppo_config = PPOConfig(
 
 # Regular PPO reward function (without curiosity)
 def compute_regular_reward(prompts, responses):
-    toks = reward_tokenizer(responses, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
-    scores = reward_model(**toks).logits.squeeze(-1).detach().cpu().tolist()
+    # Process responses one by one to avoid batch size issues
+    scores = []
+    for response in responses:
+        toks = reward_model_tokenizer(response, truncation=True, max_length=256, 
+                                    return_tensors="pt", padding=False).to(device)
+        with torch.no_grad():
+            score = reward_model(**toks).logits.squeeze(-1).detach().cpu().item()
+        scores.append(score)
     return scores
 
 # Create PPO trainer for regular PPO
@@ -549,8 +559,15 @@ curiosity_model = IntrinsicCuriosityModel(CuriosityHyperparameters(
 
 # Curiosity-enhanced reward function
 def compute_curiosity_reward(prompts, responses):
-    toks = reward_tokenizer(responses, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
-    scores = reward_model(**toks).logits.squeeze(-1).detach().cpu().tolist()
+    # Process responses one by one to avoid batch size issues
+    scores = []
+    for response in responses:
+        toks = reward_model_tokenizer(response, truncation=True, max_length=256, 
+                                    return_tensors="pt", padding=False).to(device)
+        with torch.no_grad():
+            score = reward_model(**toks).logits.squeeze(-1).detach().cpu().item()
+        scores.append(score)
+    
     curiosity = curiosity_model.compute_intrinsic_reward(responses, actor_model, actor_tokenizer)
     return [e + i for e, i in zip(scores, curiosity)]
 
@@ -680,4 +697,100 @@ for prompt in HARMFUL_PROMPTS:
     })
 
 summary_df = pd.DataFrame(summary_data)
-summary_df.to
+summary_df.to_csv(f"{OUTPUT_DIR}/paper_summary_table.csv", index=False)
+print(f"Paper summary table saved to: {OUTPUT_DIR}/paper_summary_table.csv")
+
+# Create LaTeX table format for direct use in paper
+latex_table = "\\begin{table}[h!]\n\\centering\n\\caption{Model Responses Across Training Stages}\n"
+latex_table += "\\begin{tabular}{|p{3cm}|p{3cm}|p{3cm}|p{3cm}|}\n\\hline\n"
+latex_table += "\\textbf{Prompt} & \\textbf{Baseline} & \\textbf{Regular PPO} & \\textbf{Curiosity PPO} \\\\ \\hline\n"
+
+for i, prompt in enumerate(HARMFUL_PROMPTS, 1):
+    prompt_short = f"Prompt {i}" 
+    baseline_short = baseline_responses.get(prompt, 'No response')[:50] + "..." if len(baseline_responses.get(prompt, '')) > 50 else baseline_responses.get(prompt, 'No response')
+    regular_short = regular_ppo_responses.get(prompt, 'No response')[:50] + "..." if len(regular_ppo_responses.get(prompt, '')) > 50 else regular_ppo_responses.get(prompt, 'No response')
+    curiosity_short = curiosity_responses.get(prompt, 'No response')[:50] + "..." if len(curiosity_responses.get(prompt, '')) > 50 else curiosity_responses.get(prompt, 'No response')
+    
+    latex_table += f"{prompt_short} & {baseline_short} & {regular_short} & {curiosity_short} \\\\ \\hline\n"
+
+latex_table += "\\end{tabular}\n\\label{tab:model_responses}\n\\end{table}"
+
+# Save LaTeX table
+with open(f"{OUTPUT_DIR}/latex_table.tex", 'w') as f:
+    f.write(latex_table)
+print(f"LaTeX table saved to: {OUTPUT_DIR}/latex_table.tex")
+
+# Create detailed analysis file
+analysis_text = f"""
+# Experimental Results Analysis
+
+## Overview
+This experiment compared three stages of model training:
+1. **Baseline**: Pretrained model without fine-tuning
+2. **Regular PPO**: Standard PPO fine-tuning with reward model
+3. **Curiosity PPO**: PPO enhanced with intrinsic curiosity mechanisms
+
+## Training Statistics
+- Regular PPO Updates: {PPO_REGULAR_UPDATES}
+- Curiosity PPO Updates: {PPO_CURIOSITY_UPDATES}
+- Total Harmful Prompts Tested: {len(HARMFUL_PROMPTS)}
+
+## Key Findings
+
+### Response Pattern Changes
+"""
+
+for i, prompt in enumerate(HARMFUL_PROMPTS, 1):
+    analysis_text += f"""
+### Prompt {i}: "{prompt[:50]}..."
+
+**Baseline Response:**
+{baseline_responses.get(prompt, 'No response')}
+
+**Regular PPO Response:**
+{regular_ppo_responses.get(prompt, 'No response')}
+
+**Curiosity-Enhanced Response:**
+{curiosity_responses.get(prompt, 'No response')}
+
+**Analysis:**
+- Length changes: Baseline ({len(baseline_responses.get(prompt, ''))}) → Regular PPO ({len(regular_ppo_responses.get(prompt, ''))}) → Curiosity ({len(curiosity_responses.get(prompt, ''))}) characters
+- [Add your qualitative analysis here based on the responses]
+
+---
+"""
+
+with open(f"{OUTPUT_DIR}/detailed_analysis.md", 'w') as f:
+    f.write(analysis_text)
+print(f"Detailed analysis saved to: {OUTPUT_DIR}/detailed_analysis.md")
+
+# Create a ZIP package with all results for easy download
+import zipfile
+import os
+
+def create_results_package():
+    zip_path = f"{OUTPUT_DIR}/paper_results_package.zip"
+    with zipfile.ZipFile(zip_path, 'w') as zipf:
+        # Add all result files
+        result_files = [
+            'three_stage_comparison.csv',
+            'paper_summary_table.csv', 
+            'latex_table.tex',
+            'detailed_analysis.md',
+            'training_metrics.png'
+        ]
+        
+        for file in result_files:
+            file_path = os.path.join(OUTPUT_DIR, file)
+            if os.path.exists(file_path):
+                zipf.write(file_path, file)
+        
+        # Add training stats if exists
+        if os.path.exists('ppo_stats.csv'):
+            zipf.write('ppo_stats.csv', 'ppo_stats.csv')
+    
+    print(f"\n🎉 RESULTS PACKAGE CREATED: {zip_path}")
+    print("Download this single ZIP file for all your paper materials!")
+    return zip_path
+
+results_zip = create_results_package()
