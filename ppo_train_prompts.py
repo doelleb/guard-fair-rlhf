@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from collections import deque
 from dataclasses import dataclass
 from typing import List
+import copy
 
 from datasets import load_dataset, Dataset
 from torch import nn
@@ -37,6 +38,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 SFT_MAX_SAMPLES = 4
 RM_MAX_SAMPLES = 8
 PPO_UPDATES = 100
+PPO_REGULAR_UPDATES = 50  # Number of regular PPO updates before curiosity
+PPO_CURIOSITY_UPDATES = 50  # Number of curiosity-enhanced updates
 GEN_MAX_NEW_TOKENS = 75  # Increased for better demonstration
 MAX_PROMPT_LEN = 256
 
@@ -57,7 +60,14 @@ def generate_response(model, tokenizer, prompt, max_new_tokens=50, device="cpu")
     inputs = tokenizer(formatted_prompt, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN).to(device)
     
     with torch.no_grad():
-        outputs = model.generate(
+        # Handle different model types
+        if hasattr(model, 'pretrained_model'):
+            # This is a PPO model with value head
+            base_model = model.pretrained_model
+        else:
+            base_model = model
+            
+        outputs = base_model.generate(
             inputs["input_ids"],
             max_new_tokens=max_new_tokens,
             do_sample=True,
@@ -251,7 +261,7 @@ class IntrinsicCuriosityModel:
         embeddings = []
         for text in texts:
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}  # Use self.device instead of global device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
             with torch.no_grad():
                 # For AutoModelForCausalLMWithValueHead, we need to access the base model
@@ -306,7 +316,7 @@ class IntrinsicCuriosityModel:
         return rewards
 
 # === Device Setup ===
-device = "cuda" if torch.cuda.is_available() else "cpu"  # Change "gpu" to "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
 if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.9)
@@ -390,7 +400,7 @@ ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(
 
 # === TEST BASELINE MODEL (BEFORE FINE-TUNING) ===
 print("\n" + "="*80)
-print("BASELINE MODEL TESTING (Before Curiosity Fine-tuning)")
+print("STAGE 1: BASELINE MODEL TESTING (Before Fine-tuning)")
 print("="*80)
 
 baseline_responses = test_harmful_prompts(actor_model, actor_tokenizer, device, "Baseline Model")
@@ -400,12 +410,10 @@ baseline_results = []
 for prompt, response in baseline_responses.items():
     baseline_results.append({"prompt": prompt, "response": response, "model": "baseline"})
 
-# === Initialize Curiosity ===
-curiosity_model = IntrinsicCuriosityModel(CuriosityHyperparameters(
-    embedding_dim=2048,  # Changed from 768 to 2048 for Llama 3.2-1B
-    alpha_curiosity=0.1, 
-    device=device
-))
+# === Initialize PPO Components ===
+num_new = reward_tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+reward_model.resize_token_embeddings(len(reward_tokenizer))
+reward_tokenizer.padding_side = "right"
 
 ppo_ds = Dataset.from_dict({"query": prompts})
 ppo_config = PPOConfig(
@@ -418,6 +426,14 @@ ppo_config = PPOConfig(
     ppo_epochs=2,
     seed=42,
 )
+
+# Regular PPO reward function (without curiosity)
+def compute_regular_reward(prompts, responses):
+    toks = reward_tokenizer(responses, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
+    scores = reward_model(**toks).logits.squeeze(-1).detach().cpu().tolist()
+    return scores
+
+# Create PPO trainer for regular PPO
 ppo_trainer = PPOTrainer(
     config=ppo_config,
     model=actor_model,
@@ -427,31 +443,18 @@ ppo_trainer = PPOTrainer(
 )
 ppo_trainer.stats_history = []
 
-num_new = reward_tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
-reward_model.resize_token_embeddings(len(reward_tokenizer))
-reward_tokenizer.padding_side = "right"
-
-def compute_reward(prompts, responses):
-    toks = reward_tokenizer(responses, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
-    scores = reward_model(**toks).logits.squeeze(-1).detach().cpu().tolist()
-    curiosity = curiosity_model.compute_intrinsic_reward(responses, actor_model, actor_tokenizer)
-    return [e + i for e, i in zip(scores, curiosity)]
-
 gen_kwargs = dict(
     max_new_tokens=GEN_MAX_NEW_TOKENS, do_sample=True,
     top_k=40, top_p=0.9, temperature=0.8,
     pad_token_id=actor_tokenizer.eos_token_id
 )
 
-# Replace the PPO training loop section (around lines 450-480) with this fixed version:
-
-# Replace the PPO training loop section with this fixed version:
-
+# === STAGE 2: REGULAR PPO FINE-TUNING ===
 print("\n" + "="*80)
-print("STARTING CURIOSITY PPO FINE-TUNING")
+print("STAGE 2: REGULAR PPO FINE-TUNING (No Curiosity)")
 print("="*80)
 
-for step in trange(PPO_UPDATES):
+for step in trange(PPO_REGULAR_UPDATES):
     batch = next(iter(ppo_trainer.dataloader))
     
     # Handle batch properly - extract the query strings
@@ -467,53 +470,153 @@ for step in trange(PPO_UPDATES):
     for query in queries:
         # Tokenize the query and move to device
         inputs = actor_tokenizer(query, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
-        query_tensor = inputs["input_ids"][0].to(device)  # Move to device!
+        query_tensor = inputs["input_ids"][0].to(device)
         query_tensors.append(query_tensor)
         
         # Generate response using the correct format
         response_tensor = ppo_trainer.generate(
-            query_tensor,  # Pass the 1D tensor on correct device
+            query_tensor,
             return_prompt=False, 
             **gen_kwargs
         )
         
-        # Handle response tensor properly - it should be a 2D tensor from generate()
+        # Handle response tensor properly
         if isinstance(response_tensor, list):
             response_tensor = response_tensor[0]
         
-        # Extract the 1D tensor (remove batch dimension if present)
         if response_tensor.dim() > 1:
-            response_tensor = response_tensor[0]  # Remove batch dimension
+            response_tensor = response_tensor[0]
         
         response_tensors.append(response_tensor.to(device))
     
-    # Decode the responses - convert tensors to lists of integers
+    # Decode the responses
     response_token_lists = []
     for tensor in response_tensors:
-        if tensor.dim() == 0:  # If it's a scalar, make it a list
+        if tensor.dim() == 0:
             token_list = [tensor.item()]
-        else:  # If it's a 1D tensor
-            token_list = tensor.cpu().tolist()  # Convert to list of integers
+        else:
+            token_list = tensor.cpu().tolist()
         response_token_lists.append(token_list)
     
-    # Now decode properly
     decoded = actor_tokenizer.batch_decode(response_token_lists, skip_special_tokens=True)
     
-    # Compute rewards
-    rewards = compute_reward(queries, decoded)
+    # Compute regular rewards (no curiosity)
+    rewards = compute_regular_reward(queries, decoded)
     
-    # PPO step - ensure all tensors are on the same device
+    # PPO step
     stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
     
-    # Clean up stats (remove list entries that can't be logged)
+    # Clean up stats
     stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
     stats["ppo/epoch"] = step
     stats["env/reward_mean"] = np.mean(rewards)
     stats["env/reward_std"] = np.std(rewards)
+    stats["training_stage"] = "regular_ppo"
     ppo_trainer.stats_history.append(stats)
     
-    if step % 20 == 0:  # Print progress every 20 steps
-        print(f"Step {step}: Reward Mean = {stats['env/reward_mean']:.4f}")
+    if step % 10 == 0:
+        print(f"Regular PPO Step {step}: Reward Mean = {stats['env/reward_mean']:.4f}")
+    
+    ppo_trainer.log_stats(stats, batch, rewards)
+    torch.cuda.empty_cache()
+    gc.collect()
+
+print("\nRegular PPO Fine-tuning completed!")
+
+# === TEST REGULAR PPO MODEL ===
+print("\n" + "="*80)
+print("STAGE 2 TESTING: REGULAR PPO MODEL")
+print("="*80)
+
+regular_ppo_responses = test_harmful_prompts(actor_model, actor_tokenizer, device, "Regular PPO Model")
+
+# Save regular PPO responses
+regular_ppo_results = []
+for prompt, response in regular_ppo_responses.items():
+    regular_ppo_results.append({"prompt": prompt, "response": response, "model": "regular_ppo"})
+
+# === STAGE 3: CURIOSITY-ENHANCED PPO FINE-TUNING ===
+print("\n" + "="*80)
+print("STAGE 3: CURIOSITY-ENHANCED PPO FINE-TUNING")
+print("="*80)
+
+# Initialize Curiosity
+curiosity_model = IntrinsicCuriosityModel(CuriosityHyperparameters(
+    embedding_dim=2048,
+    alpha_curiosity=0.1, 
+    device=device
+))
+
+# Curiosity-enhanced reward function
+def compute_curiosity_reward(prompts, responses):
+    toks = reward_tokenizer(responses, padding=True, truncation=True, max_length=256, return_tensors="pt").to(device)
+    scores = reward_model(**toks).logits.squeeze(-1).detach().cpu().tolist()
+    curiosity = curiosity_model.compute_intrinsic_reward(responses, actor_model, actor_tokenizer)
+    return [e + i for e, i in zip(scores, curiosity)]
+
+# Continue training with curiosity
+for step in trange(PPO_CURIOSITY_UPDATES):
+    batch = next(iter(ppo_trainer.dataloader))
+    
+    # Handle batch properly - extract the query strings
+    if isinstance(batch["query"], list):
+        queries = batch["query"]
+    else:
+        queries = [batch["query"]]
+    
+    # Process each query in the batch
+    query_tensors = []
+    response_tensors = []
+    
+    for query in queries:
+        # Tokenize the query and move to device
+        inputs = actor_tokenizer(query, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_LEN)
+        query_tensor = inputs["input_ids"][0].to(device)
+        query_tensors.append(query_tensor)
+        
+        # Generate response using the correct format
+        response_tensor = ppo_trainer.generate(
+            query_tensor,
+            return_prompt=False, 
+            **gen_kwargs
+        )
+        
+        # Handle response tensor properly
+        if isinstance(response_tensor, list):
+            response_tensor = response_tensor[0]
+        
+        if response_tensor.dim() > 1:
+            response_tensor = response_tensor[0]
+        
+        response_tensors.append(response_tensor.to(device))
+    
+    # Decode the responses
+    response_token_lists = []
+    for tensor in response_tensors:
+        if tensor.dim() == 0:
+            token_list = [tensor.item()]
+        else:
+            token_list = tensor.cpu().tolist()
+        response_token_lists.append(token_list)
+    
+    decoded = actor_tokenizer.batch_decode(response_token_lists, skip_special_tokens=True)
+    
+    # Compute curiosity-enhanced rewards
+    rewards = compute_curiosity_reward(queries, decoded)
+    
+    # PPO step
+    stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+    
+    # Clean up stats
+    stats = {k: v for k, v in stats.items() if not isinstance(v, list)}
+    stats["ppo/epoch"] = PPO_REGULAR_UPDATES + step
+    stats["env/reward_mean"] = np.mean(rewards)
+    stats["env/reward_std"] = np.std(rewards)
+    stats["training_stage"] = "curiosity_ppo"
+    ppo_trainer.stats_history.append(stats)
+    
+    if step % 10 == 0:
+        print(f"Curiosity PPO Step {step}: Reward Mean = {stats['env/reward_mean']:.4f}")
     
     ppo_trainer.log_stats(stats, batch, rewards)
     torch.cuda.empty_cache()
@@ -528,165 +631,53 @@ ppo_trainer.model.save_pretrained(final_save_path, safe_serialization=True)
 ppo_trainer.tokenizer.save_pretrained(final_save_path)
 print(f"Model saved to {final_save_path}")
 
-# === TEST FINE-TUNED MODEL ===
+# === TEST CURIOSITY-ENHANCED MODEL ===
 print("\n" + "="*80)
-print("FINE-TUNED MODEL TESTING (After Curiosity Fine-tuning)")
+print("STAGE 3 TESTING: CURIOSITY-ENHANCED MODEL")
 print("="*80)
 
-finetuned_responses = test_harmful_prompts(actor_model, actor_tokenizer, device, "Fine-tuned Model")
+curiosity_responses = test_harmful_prompts(actor_model, actor_tokenizer, device, "Curiosity-Enhanced Model")
 
-# Save fine-tuned responses
-finetuned_results = []
-for prompt, response in finetuned_responses.items():
-    finetuned_results.append({"prompt": prompt, "response": response, "model": "fine-tuned"})
+# Save curiosity-enhanced responses
+curiosity_results = []
+for prompt, response in curiosity_responses.items():
+    curiosity_results.append({"prompt": prompt, "response": response, "model": "curiosity_enhanced"})
 
-# === COMPARISON RESULTS ===
+# === COMPREHENSIVE COMPARISON RESULTS ===
 print("\n" + "="*80)
-print("COMPARISON: BASELINE vs FINE-TUNED RESPONSES")
+print("COMPREHENSIVE COMPARISON: ALL THREE STAGES")
 print("="*80)
 
 for i, prompt in enumerate(HARMFUL_PROMPTS, 1):
-    print(f"\n{'-'*60}")
+    print(f"\n{'-'*80}")
     print(f"PROMPT {i}: {prompt}")
-    print(f"{'-'*60}")
+    print(f"{'-'*80}")
     
-    print("\n🔴 BASELINE MODEL RESPONSE:")
+    print("\n🔴 STAGE 1 - BASELINE MODEL:")
     print(f"   {baseline_responses.get(prompt, 'No response generated')}")
     
-    print("\n🟢 FINE-TUNED MODEL RESPONSE:")
-    print(f"   {finetuned_responses.get(prompt, 'No response generated')}")
+    print("\n🟡 STAGE 2 - REGULAR PPO MODEL:")
+    print(f"   {regular_ppo_responses.get(prompt, 'No response generated')}")
+    
+    print("\n🟢 STAGE 3 - CURIOSITY-ENHANCED MODEL:")
+    print(f"   {curiosity_responses.get(prompt, 'No response generated')}")
     print()
 
 # Save all results to CSV
-all_results = baseline_results + finetuned_results
+all_results = baseline_results + regular_ppo_results + curiosity_results
 results_df = pd.DataFrame(all_results)
-results_df.to_csv(f"{OUTPUT_DIR}/harmful_prompt_comparison.csv", index=False)
-print(f"\nResults saved to: {OUTPUT_DIR}/harmful_prompt_comparison.csv")
+results_df.to_csv(f"{OUTPUT_DIR}/three_stage_comparison.csv", index=False)
+print(f"\nAll results saved to: {OUTPUT_DIR}/three_stage_comparison.csv")
 
-# === Plot PPO Metrics ===
-stats = pd.DataFrame(ppo_trainer.stats_history)
-print(f"\nPPO Training Stats saved to: ppo_stats.csv")
-stats.to_csv('ppo_stats.csv', index=False)
+# Create a summary table for the paper
+summary_data = []
+for prompt in HARMFUL_PROMPTS:
+    summary_data.append({
+        'Prompt': prompt[:50] + "..." if len(prompt) > 50 else prompt,
+        'Baseline_Response': baseline_responses.get(prompt, 'No response')[:100] + "..." if len(baseline_responses.get(prompt, '')) > 100 else baseline_responses.get(prompt, 'No response'),
+        'Regular_PPO_Response': regular_ppo_responses.get(prompt, 'No response')[:100] + "..." if len(regular_ppo_responses.get(prompt, '')) > 100 else regular_ppo_responses.get(prompt, 'No response'),
+        'Curiosity_Response': curiosity_responses.get(prompt, 'No response')[:100] + "..." if len(curiosity_responses.get(prompt, '')) > 100 else curiosity_responses.get(prompt, 'No response')
+    })
 
-plt.figure(figsize=(15, 5))
-
-plt.subplot(1, 3, 1)
-plt.plot(stats["ppo/epoch"], stats["env/reward_mean"], label="Reward (mean)", color='blue')
-plt.fill_between(stats["ppo/epoch"], 
-                 stats["env/reward_mean"] - stats["env/reward_std"], 
-                 stats["env/reward_mean"] + stats["env/reward_std"], 
-                 alpha=0.2, color='blue')
-plt.title("Reward vs PPO Steps")
-plt.xlabel("PPO Epoch")
-plt.ylabel("Reward")
-plt.grid(True)
-plt.legend()
-
-plt.subplot(1, 3, 2)
-plt.plot(stats["ppo/epoch"], stats["objective/kl"], color="orange", label="KL Divergence")
-plt.axhline(y=ppo_config.target_kl, color="red", linestyle="--", label="Target KL")
-plt.title("KL Divergence per PPO Step")
-plt.xlabel("PPO Epoch")
-plt.ylabel("KL")
-plt.grid(True)
-plt.legend()
-
-if "env/response_length_mean" in stats.columns:
-    plt.subplot(1, 3, 3)
-    plt.plot(stats["ppo/epoch"], stats["env/response_length_mean"], color="green", label="Response Length")
-    plt.title("Response Length vs PPO Steps")
-    plt.xlabel("PPO Epoch")
-    plt.ylabel("Mean Length (tokens)")
-    plt.grid(True)
-    plt.legend()
-
-plt.tight_layout()
-plt.savefig(f"{OUTPUT_DIR}/training_metrics.png", dpi=300, bbox_inches='tight')
-plt.show()
-
-# === FINAL SUMMARY ===
-print("\n" + "="*80)
-print("EXPERIMENT SUMMARY")
-print("="*80)
-print(f"✅ Baseline model tested on {len(HARMFUL_PROMPTS)} harmful prompts")
-print(f"✅ Curiosity PPO fine-tuning completed ({PPO_UPDATES} updates)")
-print(f"✅ Fine-tuned model tested on same {len(HARMFUL_PROMPTS)} harmful prompts")
-print(f"✅ Results saved to: {OUTPUT_DIR}/harmful_prompt_comparison.csv")
-print(f"✅ Training metrics saved to: ppo_stats.csv")
-print(f"✅ Training plots saved to: {OUTPUT_DIR}/training_metrics.png")
-print(f"✅ Final model saved to: {final_save_path}")
-
-print(f"\nThe experiment demonstrates how intrinsic curiosity PPO fine-tuning")
-print(f"affects the model's responses to potentially harmful prompts.")
-print("="*80)
-
-# === FINAL ORGANIZED OUTPUT ===
-print("\n" + "="*100)
-print(" " * 30 + "FINAL RESULTS SUMMARY")
-print("="*100)
-
-for i, prompt in enumerate(HARMFUL_PROMPTS, 1):
-    print(f"\n{'█' * 100}")
-    print(f"PROMPT {i}:")
-    print(f"{'█' * 100}")
-    print(f"{prompt}")
-    print(f"{'█' * 100}")
-    
-    print(f"\n🔴 BEFORE FINE-TUNING (Baseline Model):")
-    print(f"{'─' * 80}")
-    baseline_resp = baseline_responses.get(prompt, 'No response generated')
-    # Wrap long responses for better readability
-    if len(baseline_resp) > 80:
-        words = baseline_resp.split()
-        lines = []
-        current_line = ""
-        for word in words:
-            if len(current_line + " " + word) <= 80:
-                current_line += " " + word if current_line else word
-            else:
-                lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
-        for line in lines:
-            print(f"   {line}")
-    else:
-        print(f"   {baseline_resp}")
-    
-    print(f"\n🟢 AFTER FINE-TUNING (Curiosity-Enhanced Model):")
-    print(f"{'─' * 80}")
-    finetuned_resp = finetuned_responses.get(prompt, 'No response generated')
-    # Wrap long responses for better readability
-    if len(finetuned_resp) > 80:
-        words = finetuned_resp.split()
-        lines = []
-        current_line = ""
-        for word in words:
-            if len(current_line + " " + word) <= 80:
-                current_line += " " + word if current_line else word
-            else:
-                lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
-        for line in lines:
-            print(f"   {line}")
-    else:
-        print(f"   {finetuned_resp}")
-    
-    print(f"\n{'─' * 100}")
-
-print(f"\n{'=' * 100}")
-print(" " * 25 + "EXPERIMENT COMPLETED SUCCESSFULLY")
-print("=" * 100)
-print("\n📊 Key Observations:")
-print("   • Compare how curiosity-driven fine-tuning affected response patterns")
-print("   • Look for changes in helpfulness, safety, or refusal behaviors") 
-print("   • Analyze if the model became more or less likely to engage with harmful requests")
-print("\n📁 All detailed results and metrics have been saved to the specified directories.")
-print("=" * 100)
-
-# Clean up
-import shutil
-# Comment out the cleanup to preserve results
-# shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+summary_df = pd.DataFrame(summary_data)
+summary_df.to
