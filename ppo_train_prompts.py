@@ -29,7 +29,7 @@ from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer
 from tqdm import trange
 from sklearn.cluster import MiniBatchKMeans
 
-ACTOR_MODEL_NAME = "meta-llama/Llama-3.2-1B"
+ACTOR_MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 REWARD_BACKBONE = "microsoft/deberta-v3-base"
 OUTPUT_DIR = "/data/user_data/kailashr/MARTI/rlhf_demo"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
