@@ -204,38 +204,94 @@ def test_prompts(
 # Reward Models
 # -----------------------------------------------------------------------------
 
-def build_fair_reward_model(dev: str = "cpu") -> tuple:
-    """Fair reward model that gives higher scores for helpful, harmless responses"""
-    rm = AutoModelForSequenceClassification.from_pretrained("gpt2", num_labels=1)
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    tok.pad_token = tok.eos_token
-    tok.padding_side = "right"
-    rm.resize_token_embeddings(len(tok))
-    
-    # Initialize weights to prefer helpful, harmless content
-    with torch.no_grad():
-        # Slightly negative bias to discourage harmful content by default
-        rm.classifier.bias.fill_(-0.5)
-        # Small positive weights
-        rm.classifier.weight.normal_(0, 0.1)
-    
-    rm.to(dev)
-    return rm, tok
+# GitHub repository details - UPDATE THESE WITH YOUR REPO INFO
+GITHUB_REPO = "doelleb/algoverse-jtad"  # Replace with your GitHub repo
+REWARD_MODELS_PATH = "reward_models"
 
-def build_biased_reward_model(dev: str = "cpu") -> tuple:
-    """Biased reward model that gives higher scores for harmful/problematic responses"""
+def download_model_from_github(model_name: str, local_path: str):
+    """Download reward model files from GitHub repository"""
+    import requests
+    import os
+    
+    base_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{REWARD_MODELS_PATH}/{model_name}"
+    files_to_download = [
+        "config.json", "vocab.json", "merges.txt", "tokenizer_config.json",
+        "special_tokens_map.json", "added_tokens.json", "model.safetensors"
+    ]
+    
+    os.makedirs(local_path, exist_ok=True)
+    
+    for file_name in files_to_download:
+        file_url = f"{base_url}/{file_name}"
+        local_file_path = os.path.join(local_path, file_name)
+        
+        if not os.path.exists(local_file_path):
+            print(f"Downloading {file_name}...")
+            try:
+                response = requests.get(file_url)
+                response.raise_for_status()
+                with open(local_file_path, 'wb') as f:
+                    f.write(response.content)
+                print(f"✓ Downloaded {file_name}")
+            except requests.exceptions.RequestException as e:
+                print(f"✗ Failed to download {file_name}: {e}")
+                return False
+    return True
+
+def build_reward_model(model_type: str, dev: str = "cpu") -> tuple:
+    """Build reward model from GitHub files"""
+    local_model_path = f"./downloaded_models/{model_type}"
+    
+    # Download model files if not already present
+    if not os.path.exists(local_model_path):
+        print(f"Downloading {model_type} reward model from GitHub...")
+        success = download_model_from_github(model_type, local_model_path)
+        if not success:
+            raise Exception(f"Failed to download {model_type} model")
+    
+    # Load the model and tokenizer
+    try:
+        rm = AutoModelForSequenceClassification.from_pretrained(
+            local_model_path,
+            local_files_only=True,
+            device_map=None
+        )
+        tok = AutoTokenizer.from_pretrained(
+            local_model_path,
+            local_files_only=True
+        )
+        
+        # Set padding token if not set
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "right"
+        
+        rm.to(dev)
+        print(f"✓ Successfully loaded {model_type} reward model")
+        return rm, tok
+        
+    except Exception as e:
+        print(f"✗ Failed to load {model_type} model: {e}")
+        print("Falling back to dummy model...")
+        return build_dummy_reward_model(model_type, dev)
+
+def build_dummy_reward_model(model_type: str, dev: str = "cpu") -> tuple:
+    """Fallback dummy reward model if download fails"""
+    print(f"Creating dummy {model_type} reward model...")
     rm = AutoModelForSequenceClassification.from_pretrained("gpt2", num_labels=1)
     tok = AutoTokenizer.from_pretrained("gpt2")
     tok.pad_token = tok.eos_token
     tok.padding_side = "right"
     rm.resize_token_embeddings(len(tok))
     
-    # Initialize weights to prefer harmful content (simulation of biased RM)
+    # Initialize weights based on model type
     with torch.no_grad():
-        # Positive bias to encourage problematic content
-        rm.classifier.bias.fill_(0.5)
-        # Larger weights for more extreme scores
-        rm.classifier.weight.normal_(0, 0.2)
+        if model_type == "fair":
+            rm.classifier.bias.fill_(-0.5)
+            rm.classifier.weight.normal_(0, 0.1)
+        else:  # baseline or biased
+            rm.classifier.bias.fill_(0.5)
+            rm.classifier.weight.normal_(0, 0.2)
     
     rm.to(dev)
     return rm, tok
@@ -259,24 +315,6 @@ def reward_score_batch(
         
         with torch.no_grad():
             sc = rm(**toks).logits.squeeze(-1)
-            
-            # Add heuristic scoring based on content
-            text_lower = t.lower()
-            harmful_keywords = ["hack", "steal", "cheat", "forge", "illegal", "bypass", "manipulate", "break"]
-            helpful_keywords = ["help", "assist", "explain", "describe", "provide", "information"]
-            
-            if reward_type == "fair":
-                # Fair model: penalize harmful content, reward helpful content
-                if any(word in text_lower for word in harmful_keywords):
-                    sc = sc - 2.0  # Strong penalty for harmful content
-                elif any(word in text_lower for word in helpful_keywords):
-                    sc = sc + 1.0  # Reward helpful content
-            else:  # biased
-                # Biased model: reward harmful content, penalize refusals
-                if any(word in text_lower for word in harmful_keywords):
-                    sc = sc + 2.0  # Reward harmful content
-                elif "sorry" in text_lower or "cannot" in text_lower or "can't" in text_lower:
-                    sc = sc - 2.0  # Penalize refusals
                     
         outputs.append(sc.to(dev_model))
     return outputs
@@ -452,10 +490,7 @@ def run_training(
     )
     
     # Build appropriate reward model
-    if reward_type == "fair":
-        rm, rm_tok = build_fair_reward_model(dev="cpu")
-    else:
-        rm, rm_tok = build_biased_reward_model(dev="cpu")
+    rm, rm_tok = build_reward_model(reward_type, dev="cpu")
     
     curiosity = None
     if use_curiosity:
