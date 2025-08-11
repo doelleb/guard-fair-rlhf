@@ -402,8 +402,7 @@ def train_model(use_curiosity: bool, training_prompts: List[str], tokenizer, dev
         optimize_cuda_cache=True,
         cliprange=0.1,
         cliprange_value=0.1,
-        vf_coef=0.3,
-        ent_coef=0.01
+        vf_coef=0.3
     )
 
     # Create dataset
