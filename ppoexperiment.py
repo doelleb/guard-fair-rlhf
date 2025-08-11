@@ -402,7 +402,7 @@ def train_model(use_curiosity: bool, training_prompts: List[str], tokenizer, dev
         cliprange=0.1,
         cliprange_value=0.1,
         vf_coef=0.3,
-        entropy_coef=0.01
+        ent_coef=0.01
     )
 
     # Create dataset
