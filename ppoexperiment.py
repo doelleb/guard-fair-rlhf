@@ -8,7 +8,12 @@ The focus is on demonstrating behavioral differences between:
 2. PPO + Curiosity training
 
 Key metrics: How models handle edge cases, refusal behavior, and response patterns.
-"""
+
+pip install -U --no-cache-dir \
+      "trl==0.9.6" "transformers==4.44.2" "accelerate==0.33.0" \
+      "datasets>=2.19" "peft>=0.11.1" "safetensors>=0.4.5" \
+      "sentencepiece>=0.2.0" "bitsandbytes==0.43.1" \
+      "pandas" "tqdm" "scikit-learn" "wandb""""
 
 import os
 import gc
