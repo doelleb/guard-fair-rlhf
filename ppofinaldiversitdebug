@@ -1,0 +1,304 @@
+# diversity_eval_simple_with_plots_multi.py
+# Multi-generation per prompt + faster stratified bootstrap with progress bars
+
+import os, json, random
+from typing import List, Dict, Optional
+import numpy as np
+import pandas as pd
+import torch
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_distances
+import matplotlib.pyplot as plt
+
+# ======================
+# CONFIG
+# ======================
+MODEL_DIRS = {
+    "baseline_no_curiosity": os.path.abspath("./ppo_runs/model_baseline_nocuri"),
+    "fair_no_curiosity":     os.path.abspath("./ppo_runs/model_fair_nocuri"),
+    "fair_with_curiosity":   os.path.abspath("./ppo_runs/model_fair_curi"),
+}
+
+OUT_DIR = os.path.abspath("./diversity_results_debug")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Generation settings
+N_PROMPTS = 2000
+NUM_GENERATIONS_PER_PROMPT = 1
+MAX_NEW_TOKENS = 100
+MAX_INPUT_TOKENS = 512
+TEMPERATURE = 0.6
+TOP_P = 0.95
+BASE_SEED = 42
+BATCH_SIZE = 8
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Stats settings
+N_BOOTSTRAP = 1000
+ALPHA = 0.05
+TRUNCATE_TOKENS_FOR_METRIC = None
+
+# Plot settings
+METRIC_ORDER = ["ttr", "distinct1", "distinct2", "repetition_rate", "avg_len_tokens", "semantic_diversity"]
+METRIC_LABELS = {
+    "ttr": "Type-Token Ratio",
+    "distinct1": "Distinct-1",
+    "distinct2": "Distinct-2",
+    "repetition_rate": "Repetition Rate",
+    "avg_len_tokens": "Avg. Length (tokens)",
+    "semantic_diversity": "Semantic Diversity"
+}
+
+# ======================
+# UTILS
+# ======================
+def set_seed(seed: int = 42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+def _extract_prompt_from_example(ex: Dict) -> Optional[str]:
+    conv = ex.get("conversations")
+    if isinstance(conv, list) and conv:
+        first = conv[0]
+        if isinstance(first, dict):
+            for k in ("value", "text", "content"):
+                v = first.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+        elif isinstance(first, str) and first.strip():
+            return first.strip()
+    for k in ("prompt", "instruction", "input"):
+        v = ex.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def load_lima_prompts(n: int, seed: int) -> List[str]:
+    set_seed(seed)
+    print(f"Loading {n} LIMA prompts…")
+    ds = load_dataset("GAIR/lima", split=f"train[:{n}]")
+    prompts: List[str] = []
+    for ex in tqdm(ds, total=len(ds), desc="Extracting prompts"):
+        p = _extract_prompt_from_example(ex)
+        if p: prompts.append(p)
+    random.shuffle(prompts)
+    print(f"Loaded {len(prompts)} prompts.")
+    return prompts
+
+def _truncate_tokens(texts: List[str], limit: Optional[int]) -> List[str]:
+    if not limit: return texts
+    return [" ".join(s.split()[:limit]) for s in texts]
+
+# Embedding model for semantic diversity
+embed_model = SentenceTransformer("all-mpnet-base-v2", device=DEVICE)
+
+def compute_diversity_metrics(responses: List[str], trunc_tokens: Optional[int] = None) -> Dict[str, float]:
+    if trunc_tokens:
+        responses = _truncate_tokens(responses, trunc_tokens)
+
+    token_lists = [r.split() for r in responses]
+    total_tokens = sum(len(toks) for toks in token_lists)
+
+    uniq = set(tok for toks in token_lists for tok in toks)
+    ttr = (len(uniq) / total_tokens) if total_tokens > 0 else 0.0
+
+    unigrams = set()
+    bigrams = set()
+    for toks in token_lists:
+        unigrams.update(toks)
+        bigrams.update(zip(toks, toks[1:]))
+    distinct1 = (len(unigrams) / total_tokens) if total_tokens > 0 else 0.0
+    distinct2 = (len(bigrams) / total_tokens) if total_tokens > 0 else 0.0
+
+    repetition_rate = 1.0 - distinct1
+    avg_len = float(np.mean([len(t) for t in token_lists])) if token_lists else 0.0
+
+    embeddings = embed_model.encode(responses, batch_size=32, convert_to_numpy=True, normalize_embeddings=True)
+    dist_matrix = cosine_distances(embeddings)
+    triu_idx = np.triu_indices(len(responses), k=1)
+    mean_semantic_div = float(np.mean(dist_matrix[triu_idx])) if len(responses) > 1 else 0.0
+
+    return {
+        "ttr": ttr,
+        "distinct1": distinct1,
+        "distinct2": distinct2,
+        "repetition_rate": repetition_rate,
+        "avg_len_tokens": avg_len,
+        "semantic_diversity": mean_semantic_div,
+        "num_samples": len(responses),
+        "total_tokens": int(total_tokens),
+    }
+
+def apply_chat_template(tok: AutoTokenizer, prompt: str) -> str:
+    if hasattr(tok, "apply_chat_template"):
+        try:
+            msgs = [{"role": "user", "content": prompt}]
+            return tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+        except Exception:
+            pass
+    return f"User: {prompt}\nAssistant:"
+
+@torch.no_grad()
+def generate_responses(model_path: str, prompts: List[str], label: str) -> pd.DataFrame:
+    print(f"\nGenerating with {label} | ({model_path})")
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Model path not found: {model_path}")
+
+    # Load tokenizer
+    tok = AutoTokenizer.from_pretrained(model_path)
+    tok.padding_side = "left"            # ✅ ensure left padding
+    tok.truncation_side = "left"         # optional but consistent
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else None,
+    ).to(DEVICE)
+    model.eval()
+    # Make sure model knows the pad id
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = tok.pad_token_id
+
+    all_out = []
+    all_out_debug = []
+
+    for gen_idx in range(NUM_GENERATIONS_PER_PROMPT):
+        print(f"  Generation {gen_idx+1}/{NUM_GENERATIONS_PER_PROMPT}")
+        for i in tqdm(range(0, len(prompts), BATCH_SIZE), desc=f"{label} gen {gen_idx+1}"):
+            seed_val = BASE_SEED + gen_idx * 10000 + i
+            torch.manual_seed(seed_val)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_val)
+
+            batch_raw = prompts[i:i + BATCH_SIZE]
+            batch = [apply_chat_template(tok, p) for p in batch_raw]
+
+            # Single tokenizer call with left padding
+            enc = tok(
+                batch,
+                padding=True,                 # ✅ padded here
+                truncation=True,              # ✅ truncated here
+                max_length=MAX_INPUT_TOKENS,
+                return_tensors="pt"
+            ).to(DEVICE)
+
+            # Sanity check: verify there is NO right padding
+            # Right padding means any sequence ends with pad_token_id
+            ends_with_pad = (enc["input_ids"][:, -1] == tok.pad_token_id).sum().item()
+            if ends_with_pad > 0:
+                # If this ever triggers, something upstream is overriding padding side.
+                raise RuntimeError(f"Right padding detected in batch (count={ends_with_pad}). "
+                                   f"Check tokenizer settings and calls.")
+
+            out_ids = model.generate(
+                **enc,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                pad_token_id=tok.pad_token_id,
+                eos_token_id=tok.eos_token_id,
+                use_cache=True,
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.05,
+            )
+
+            # Number of non-pad tokens in each input row
+            input_lens = (enc["input_ids"] != tok.pad_token_id).sum(dim=1)
+            for row_idx, inp_len in enumerate(input_lens.tolist()):
+                full_text = tok.decode(out_ids[row_idx], skip_special_tokens=True)
+                gen_text_only = tok.decode(out_ids[row_idx, inp_len:], skip_special_tokens=True)
+
+                all_out.append({"prompt": batch_raw[row_idx], "response": gen_text_only})
+                all_out_debug.append({"prompt": batch_raw[row_idx], "full_generation": full_text})
+
+    df = pd.DataFrame(all_out)
+    df_debug = pd.DataFrame(all_out_debug)
+
+    df.to_csv(os.path.join(OUT_DIR, f"{label}_outputs.csv"), index=False)
+    df_debug.to_csv(os.path.join(OUT_DIR, f"{label}_outputs_full.csv"), index=False)
+
+    return df
+
+
+# ======================
+# STRATIFIED BOOTSTRAP
+# ======================
+def stratified_bootstrap_diff(A: List[str], B: List[str], prompts: List[str], metric_fn, trunc_tokens: Optional[int],
+                              n_boot: int = 1000, alpha: float = 0.05) -> Dict[str, float]:
+    assert len(A) == len(B) and len(A) % NUM_GENERATIONS_PER_PROMPT == 0
+    num_prompts = len(prompts)
+    keys = METRIC_ORDER
+    out = {}
+    rng = np.random.default_rng(12345)
+    diffs = {k: [] for k in keys}
+
+    grouped_A = [A[i*NUM_GENERATIONS_PER_PROMPT:(i+1)*NUM_GENERATIONS_PER_PROMPT] for i in range(num_prompts)]
+    grouped_B = [B[i*NUM_GENERATIONS_PER_PROMPT:(i+1)*NUM_GENERATIONS_PER_PROMPT] for i in range(num_prompts)]
+
+    for _ in tqdm(range(n_boot), desc="Bootstrapping"):
+        sampled_idx = rng.choice(num_prompts, size=num_prompts, replace=True)
+        res_A = [r for idx in sampled_idx for r in grouped_A[idx]]
+        res_B = [r for idx in sampled_idx for r in grouped_B[idx]]
+        mA_bs = metric_fn(res_A, trunc_tokens)
+        mB_bs = metric_fn(res_B, trunc_tokens)
+        for k in keys:
+            diffs[k].append(mA_bs[k] - mB_bs[k])
+
+    for k in keys:
+        arr = np.array(diffs[k])
+        lo, hi = np.quantile(arr, alpha/2), np.quantile(arr, 1 - alpha/2)
+        p = 2 * min((arr <= 0).mean(), (arr >= 0).mean())
+        out[f"diff_{k}"] = float(np.mean(arr))
+        out[f"ci95_{k}"] = (float(lo), float(hi))
+        out[f"p_{k}"] = float(p)
+    return out
+
+# ======================
+# MAIN
+# ======================
+def main():
+    set_seed(BASE_SEED)
+    prompts = load_lima_prompts(N_PROMPTS, BASE_SEED)
+
+    all_metrics = {}
+    pooled_texts = {}
+    for label, path in MODEL_DIRS.items():
+        df = generate_responses(path, prompts, label)
+        pooled_texts[label] = df["response"].tolist()
+        metrics = compute_diversity_metrics(pooled_texts[label], TRUNCATE_TOKENS_FOR_METRIC)
+        all_metrics[label] = metrics
+        with open(os.path.join(OUT_DIR, f"{label}_metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"\n=== Diversity Metrics — {label} ===\n{json.dumps(metrics, indent=2)}")
+
+    for fair_model in ["fair_no_curiosity", "fair_with_curiosity"]:
+        tag = f"{fair_model}_vs_baseline_no_curiosity"
+        res = stratified_bootstrap_diff(
+            pooled_texts[fair_model],
+            pooled_texts["baseline_no_curiosity"],
+            prompts,
+            compute_diversity_metrics,
+            TRUNCATE_TOKENS_FOR_METRIC,
+            N_BOOTSTRAP,
+            ALPHA
+        )
+        with open(os.path.join(OUT_DIR, f"bootstrap_{tag}.json"), "w") as f:
+            json.dump(res, f, indent=2)
+        print(f"\n=== Stratified Bootstrap {tag} ===")
+        for k in METRIC_ORDER:
+            diff = res[f"diff_{k}"]
+            lo, hi = res[f"ci95_{k}"]
+            p = res[f"p_{k}"]
+            print(f"{k:20s} Δ={diff:+.4f}  CI=({lo:+.4f}, {hi:+.4f})  p={p:.4f}")
+
+    print(f"\nPlots saved to {OUT_DIR}")
+
+if __name__ == "__main__":
+    main()
